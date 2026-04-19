@@ -930,26 +930,47 @@ function AuditPanel(){
 
 function AgentChatPanel(){
   const [msgs,setMsgs] = useState([
-    { role:"sys", text:"Claude-powered IcM assistant. Full graph context (18 services, 43 rel types, 127 edges) + 400 episodes injected via system prompt." },
-    { role:"asst", text:"Hi — ask me about any incident, service, or root cause. I'll traverse the graph and cite episode IDs." },
+    { role:"sys", text:"Graph-grounded chat. Questions are translated to Cypher and executed against live Neo4j (bolt://localhost:7688). If the chat_server is offline the panel falls back to in-browser rules." },
+    { role:"asst", text:"Ask me anything about the seeded graph — incidents, root causes (DNS, CPU, MemLeak, ConnPool…), blast radius, dependents, owners, cycles, regressions." },
   ]);
   const [input,setInput] = useState("");
   const contextRef = useRef({ lastIncident:null, lastService:null });
   const presets = [
-    "Why did ServiceA fail in INC-456?",
-    "What's the blast radius of DbService?",
-    "Any regressions introduced in the last 7 days?",
-    "Cycle detection on Platform tier",
+    "Any incidents related to DNS?",
+    "Any incidents impact more than 3 services?",
+    "Blast radius of ServiceA up to 3 hops",
+    "Which team owns DbService?",
+    "Detect cycles",
+    "Regressions introduced by deployments",
   ];
-  const send = text => {
+  const send = async text => {
     if(!text.trim()) return;
-    setMsgs(m=>[...m,{role:"user",text}]);
+    setMsgs(m=>[...m,{role:"user",text},{role:"asst",text:"…thinking (querying Neo4j)"}]);
     setInput("");
-    setTimeout(()=>{
+    let reply = null;
+    try {
+      const r = await fetch("http://127.0.0.1:8765/chat", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ question: text })
+      });
+      if(r.ok){
+        const j = await r.json();
+        const ev = Array.isArray(j.evidence) && j.evidence.length
+          ? "\n\nEvidence ("+j.handler+"): "+JSON.stringify(j.evidence.slice(0,4))
+          : "\n\n(handler: "+j.handler+")";
+        reply = (j.answer || "(empty)") + ev;
+      }
+    } catch(_e){ /* server offline -> fallback */ }
+    if(reply === null){
       const out = answerNlQuery(text, contextRef.current);
       contextRef.current = { ...contextRef.current, ...out.ctx };
-      setMsgs(m=>[...m,{role:"asst",text:out.text}]);
-    },500);
+      reply = "[offline-fallback] " + out.text;
+    }
+    setMsgs(m=>{
+      const base = m.slice(0,-1); // drop the …thinking placeholder
+      return [...base,{role:"asst",text:reply}];
+    });
   };
   return (
     <div className="grid grid-cols-12 gap-4">

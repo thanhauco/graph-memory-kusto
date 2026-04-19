@@ -31,6 +31,23 @@ python -m http.server 8080 --bind 127.0.0.1
 # open http://localhost:8080/
 ```
 
+### Agent Chat backend (Neo4j-grounded inference)
+
+Start this in a second terminal before using the Advanced -> Agent Chat panel.
+
+```powershell
+$env:NEO4J_URI  = 'bolt://localhost:7688'
+$env:NEO4J_USER = 'neo4j'
+$env:NEO4J_PASS = 'neo4jpass'
+
+python graph-service/chat_server.py
+# listens on http://127.0.0.1:8765
+```
+
+The chat panel posts questions to /chat and receives graph-grounded answers
+from live Cypher queries. If Azure OpenAI env vars are present, answers are
+optionally LLM-polished while staying grounded in the evidence rows.
+
 ---
 
 ## Quickstart — dedicated Neo4j for this project (separate container)
