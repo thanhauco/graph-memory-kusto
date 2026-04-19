@@ -1,0 +1,21 @@
+# Python GraphRAG sidecar — exposes IcM agent at :8000/chat
+FROM python:3.12-slim
+WORKDIR /app
+
+COPY agents/              ./agents/
+COPY graph-service/       ./graph_service/
+COPY vector-service/      ./vector_service/
+COPY episodic-memory/     ./episodic_memory/
+COPY memory-orchestrator/ ./memory_orchestrator/
+COPY infrastructure/graphrag_server.py ./server.py
+
+RUN pip install --no-cache-dir \
+      fastapi uvicorn[standard] \
+      -r agents/requirements.txt \
+      -r graph_service/requirements.txt \
+      -r vector_service/requirements.txt \
+      -r episodic_memory/requirements.txt
+
+ENV PYTHONPATH=/app
+EXPOSE 8000
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

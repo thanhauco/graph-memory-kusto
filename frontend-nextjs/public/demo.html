@@ -1,0 +1,1105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>GraphRAG + MemMachine Hybrid — IcM Memory System</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html,body{background:#0b0f19;color:#e5e7eb;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .glass{background:rgba(17,24,39,.7);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.06)}
+  .chip{display:inline-flex;align-items:center;gap:.35rem;padding:.15rem .55rem;border-radius:999px;font-size:.7rem;font-weight:600}
+  .grad-border{position:relative}
+  .grad-border::before{content:"";position:absolute;inset:0;padding:1px;border-radius:.75rem;background:linear-gradient(135deg,#7c3aed,#06b6d4,#10b981);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
+  .flow-dash{stroke-dasharray:6 6;animation:dash 1.2s linear infinite}
+  @keyframes dash{to{stroke-dashoffset:-24}}
+  .pulse-dot{animation:pulse 1.4s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+  .scroll-thin::-webkit-scrollbar{width:8px;height:8px}
+  .scroll-thin::-webkit-scrollbar-thumb{background:#334155;border-radius:8px}
+  details>summary{cursor:pointer;list-style:none}
+  details>summary::-webkit-details-marker{display:none}
+  input[type=range]{accent-color:#7c3aed}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useMemo, useEffect, useRef } = React;
+
+/* =========================================================
+   SHARED DATA — drawn from CONTEXT.md
+   ========================================================= */
+const SERVICES = {
+  API:      ["ApiGateway","AuthService","BillingAPI","NotifyAPI"],
+  Platform: ["ServiceA","ServiceB","ServiceC","PaymentProc","MsgBroker","SearchSvc"],
+  Data:     ["DbService","CacheLayer","BlobStore","IndexStore","QueueStore","VectorDB","GraphDB"],
+};
+const ALL_SERVICES = Object.values(SERVICES).flat();
+
+const EPISODES = [
+  { id:"ep-001", incident:"INC-456", query:"Why did service A fail?",
+    hop_path:"INC-456 →[AFFECTS]→ ServiceA →[DEPENDS_ON]→ ServiceB →[CAUSED_BY]→ HighCPU",
+    hops:3, outcome:"Restart ServiceB. Set CPU autoscale threshold 80%. Deploy circuit breaker on ServiceA→ServiceB edge.",
+    confidence:0.94, tag:"RCA" },
+  { id:"ep-002", incident:"INC-789", query:"API timeout cascade root cause",
+    hop_path:"ApiGateway →[ROUTES_TO]→ ServiceC →[DEPENDS_ON]→ DbService →[CAUSED_BY]→ ConnPoolExhaustion",
+    hops:4, outcome:"Increase connection pool size from 10 to 50.",
+    confidence:0.87, tag:"RETRIEVAL" },
+  { id:"ep-003", incident:"INC-234", query:"DB connection pool exhaustion",
+    hop_path:"Multiple services → DbService → ConnPool saturation during overnight batch",
+    hops:5, outcome:"pool_size=50 + circuit breaker on all downstream edges.",
+    confidence:0.91, tag:"RCA" },
+  { id:"ep-004", incident:"INC-901", query:"Deployment regression memory leak",
+    hop_path:"AuthService →[INTRODUCED_BY]→ v2.3.1 →[CONTAINS]→ MemLeak",
+    hops:2, outcome:"Rollback to v2.3.0.",
+    confidence:0.78, tag:"REGRESSION" },
+];
+
+const ATLAS = [
+  { id:"AML.T0051", attack:"Prompt injection via incident title",                     risk:"High",   status:"Mitigated", cat:"Injection" },
+  { id:"AML.T0054", attack:"Indirect injection through graph node properties",        risk:"High",   status:"Mitigated", cat:"Injection" },
+  { id:"AML.T0020", attack:"Episodic memory poisoning (low-confidence episodes)",     risk:"Medium", status:"Partial",   cat:"Poisoning" },
+  { id:"AML.T0031", attack:"RAG poisoning via malicious graph nodes",                 risk:"High",   status:"Mitigated", cat:"Poisoning" },
+  { id:"AML.T0043", attack:"MCP tool description poisoning",                          risk:"Medium", status:"Mitigated", cat:"Supply chain" },
+  { id:"AML.T0025", attack:"Model inversion via systematic RCA enumeration",          risk:"Medium", status:"Partial",   cat:"Exfil" },
+  { id:"AML.T0057", attack:"Cross-team episode exfiltration",                         risk:"Low",    status:"Mitigated", cat:"Exfil" },
+  { id:"AML.T0040", attack:"Resource exhaustion via deep traversal",                  risk:"Medium", status:"Mitigated", cat:"DoS" },
+  { id:"AML.T0048", attack:"Jailbreak via fictional incident framing",                risk:"Low",    status:"Mitigated", cat:"Injection" },
+];
+
+const PERF = [
+  { label:"Episodic retrieval (pgvector ANN)", ms:18,   note:"HNSW index" },
+  { label:"Graph traversal 3-hop (Neo4j GDS)", ms:48,   note:"p99, ↓22% vs baseline" },
+  { label:"Kusto telemetry query (ADE)",        ms:210,  note:"" },
+  { label:"LLM synthesis — cached prefix",      ms:380,  note:"KV cache hit" },
+  { label:"LLM synthesis — cold",               ms:1240, note:"" },
+  { label:"End-to-end — cached",                ms:670,  note:"" },
+  { label:"End-to-end — cold",                  ms:1820, note:"" },
+];
+
+const SQL_VS_CYPHER = [
+  { title:"3-hop root cause traversal",
+    cypher:`MATCH (i:Incident {id:"INC-456"})
+  -[:AFFECTS]->(s)-[:DEPENDS_ON]->(d)-[:CAUSED_BY]->(r)
+RETURN i.id, s.name, d.name, r.type`,
+    sql:`-- 3 recursive JOINs + CTE, FK columns must exist
+WITH hop1 AS (SELECT * FROM incident_service WHERE incident_id='INC-456'),
+     hop2 AS (SELECT h.*, ds.target FROM hop1 h
+              JOIN service_deps ds ON ds.source = h.service),
+     hop3 AS (SELECT h.*, rc.type FROM hop2 h
+              JOIN service_rootcause rc ON rc.service = h.target)
+SELECT * FROM hop3;  -- brittle, rewrite per depth`},
+  { title:"Variable-length blast radius (1..5)",
+    cypher:`MATCH path=(i:Incident {id:"INC-456"})-[:AFFECTS*1..5]->(s)
+RETURN DISTINCT s.name, length(path) AS hops`,
+    sql:`-- impossible in standard SQL without recursive CTE per depth
+-- and even then cannot express variable upper bound cleanly`},
+  { title:"Cycle detection",
+    cypher:`MATCH path=(s:Service)-[:DEPENDS_ON*2..8]->(s)
+RETURN [n IN nodes(path) | n.name] AS cycle`,
+    sql:`-- requires recursive CTE w/ visited-set tracking, vendor-specific`},
+  { title:"Shortest path",
+    cypher:`MATCH p=shortestPath((a:Service{name:"ApiGateway"})-[:DEPENDS_ON*]-(b:Service{name:"DbService"}))
+RETURN [n IN nodes(p) | n.name]`,
+    sql:`-- no native SQL primitive; usually export to graph engine`},
+  { title:"Multi-hop with type filters",
+    cypher:`MATCH (i:Incident)-[:AFFECTS]->(s)-[:OWNS]-(t:Team)
+WHERE i.severity<=2 RETURN t.name, count(i)`,
+    sql:`-- doable but requires 3 joins + pre-materialized edges table`},
+  { title:"Regression path attribution",
+    cypher:`MATCH (i:Incident)-[:INTRODUCED_BY]->(d:Deployment)
+WHERE d.deployedAt > date()-7
+RETURN i.id, d.version, d.deployedBy`,
+    sql:`-- requires deployment_incident link table + temporal filters`},
+];
+
+const NL_TEMPLATES = [
+  { nl:"show all incidents that affected ServiceA in the last week",
+    cypher:`MATCH (i:Incident)-[:AFFECTS]->(s:Service {name:"ServiceA"})
+WHERE i.createdDate > date()-7
+RETURN i.id, i.title, i.severity
+ORDER BY i.createdDate DESC`,
+    rows:[{id:"INC-456",title:"ServiceA 5xx spike",sev:2},{id:"INC-511",title:"latency regression",sev:3}] },
+  { nl:"what services depend on DbService?",
+    cypher:`MATCH (s:Service)-[:DEPENDS_ON]->(:Service {name:"DbService"})
+RETURN s.name, s.tier`,
+    rows:[{name:"ServiceB",tier:"Platform"},{name:"ServiceC",tier:"Platform"},{name:"BillingAPI",tier:"API"}] },
+  { nl:"find root cause of INC-456",
+    cypher:`MATCH (i:Incident {id:"INC-456"})-[:AFFECTS]->(s)-[:DEPENDS_ON]->(d)-[:CAUSED_BY]->(r:RootCause)
+RETURN r.type, r.description`,
+    rows:[{type:"HighCPU",description:"ServiceB CPU saturation during peak"}] },
+  { nl:"which team owns ServiceA?",
+    cypher:`MATCH (t:Team)-[:OWNS]->(:Service {name:"ServiceA"})
+RETURN t.name, t.slackChannel, t.oncallRotation`,
+    rows:[{name:"Platform-Core",slackChannel:"#plat-core",oncallRotation:"weekly"}] },
+  { nl:"blast radius of ServiceA up to 3 hops",
+    cypher:`MATCH p=(:Service {name:"ServiceA"})-[:DEPENDS_ON*1..3]->(s)
+RETURN DISTINCT s.name, length(p) AS hops ORDER BY hops`,
+    rows:[{name:"ServiceB",hops:1},{name:"DbService",hops:2},{name:"CacheLayer",hops:3}] },
+];
+
+const SCHEMA_ENTITIES = [
+  { name:"Incident",   color:"#ef4444", props:["id","title","severity","status","createdDate","ttm"], idx:["id","createdDate","severity"] },
+  { name:"Service",    color:"#06b6d4", props:["name","tier","health","sla","poolSize","circuitBreaker"], idx:["name","tier"] },
+  { name:"RootCause",  color:"#f59e0b", props:["type","description","frequency","autoRemediation"], idx:["type"] },
+  { name:"Team",       color:"#10b981", props:["name","oncallRotation","slackChannel","escalationPolicy"], idx:["name"] },
+  { name:"Alert",      color:"#a855f7", props:["alertId","rule","threshold","firedAt","source"], idx:["alertId"] },
+  { name:"Deployment", color:"#ec4899", props:["version","service","deployedAt","deployedBy","rollbackVersion","status"], idx:["version","service"] },
+];
+
+/* =========================================================
+   ATOMS
+   ========================================================= */
+const Card = ({children,className=""}) =>
+  <div className={`glass rounded-xl p-5 ${className}`}>{children}</div>;
+
+const Section = ({title,subtitle,children,right}) =>
+  <div className="mb-6">
+    <div className="flex items-end justify-between mb-3">
+      <div>
+        <h2 className="text-lg font-semibold text-white">{title}</h2>
+        {subtitle && <p className="text-xs text-slate-400 mt-0.5">{subtitle}</p>}
+      </div>
+      {right}
+    </div>
+    {children}
+  </div>;
+
+const Chip = ({children,color="slate"}) => {
+  const map = {
+    slate:"bg-slate-700/60 text-slate-200",
+    green:"bg-emerald-500/15 text-emerald-300 border border-emerald-500/30",
+    red:"bg-rose-500/15 text-rose-300 border border-rose-500/30",
+    amber:"bg-amber-500/15 text-amber-300 border border-amber-500/30",
+    blue:"bg-cyan-500/15 text-cyan-300 border border-cyan-500/30",
+    purple:"bg-violet-500/15 text-violet-300 border border-violet-500/30",
+  };
+  return <span className={`chip ${map[color]||map.slate}`}>{children}</span>;
+};
+
+const Bar = ({value,max,color="#7c3aed"}) =>
+  <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+    <div className="h-full rounded-full transition-all"
+         style={{width:`${Math.min(100,(value/max)*100)}%`,background:color}}/>
+  </div>;
+
+/* =========================================================
+   PART I — CORE
+   ========================================================= */
+
+function ArchitecturePanel(){
+  const layers = [
+    ["User","#64748b"],
+    ["Next.js UI","#06b6d4"],
+    ["Memory Orchestrator (.NET / LangGraph)","#7c3aed"],
+    ["Episodic · Graph · Vector","#10b981"],
+    ["LLM Layer (Azure OpenAI / GPT-4)","#f59e0b"],
+    ["Memory Writer (encode + index)","#ec4899"],
+    ["Persistent Storage (PostgreSQL / CosmosDB / Blob)","#64748b"],
+  ];
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      <Card className="col-span-12 lg:col-span-8">
+        <h3 className="font-semibold text-white mb-3">7-Layer Flow</h3>
+        <svg viewBox="0 0 700 480" className="w-full h-[480px]">
+          <defs>
+            <marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+              <path d="M0,0 L8,4 L0,8 Z" fill="#94a3b8"/>
+            </marker>
+          </defs>
+          {layers.map(([label,color],i)=>{
+            const y = 20+i*64;
+            return (
+              <g key={i}>
+                <rect x="140" y={y} width="420" height="44" rx="10"
+                      fill={color+"22"} stroke={color} strokeWidth="1.5"/>
+                <text x="350" y={y+27} textAnchor="middle" fill="#e5e7eb" fontSize="13" fontWeight="600">{label}</text>
+                {i<layers.length-1 && (
+                  <line x1="350" y1={y+44} x2="350" y2={y+64}
+                        stroke="#94a3b8" strokeWidth="1.5" markerEnd="url(#a1)" className="flow-dash"/>
+                )}
+              </g>
+            );
+          })}
+          <rect x="20" y={20+2*64} width="110" height="44" rx="10" fill="#06b6d422" stroke="#06b6d4"/>
+          <text x="75" y={20+2*64+27} textAnchor="middle" fill="#e5e7eb" fontSize="11" fontWeight="600">Kusto ADX</text>
+          <line x1="130" y1={20+2*64+22} x2="140" y2={20+2*64+22} stroke="#06b6d4" strokeWidth="1.5" markerEnd="url(#a1)"/>
+        </svg>
+      </Card>
+      <Card className="col-span-12 lg:col-span-4">
+        <h3 className="font-semibold text-white mb-3">Memory Lifecycle</h3>
+        <div className="flex flex-wrap gap-2">
+          {["Encode","Store","Retrieve","Reason","Update","Forget"].map((p,i)=>
+            <Chip key={p} color={["purple","blue","green","amber","red","slate"][i]}>{p}</Chip>)}
+        </div>
+        <div className="mt-5 space-y-2 text-sm text-slate-300">
+          <div className="flex justify-between"><span>Service nodes</span><span className="text-white font-mono">18</span></div>
+          <div className="flex justify-between"><span>Relationship types</span><span className="text-white font-mono">43</span></div>
+          <div className="flex justify-between"><span>Edges</span><span className="text-white font-mono">127</span></div>
+          <div className="flex justify-between"><span>Incidents (Kusto 7d)</span><span className="text-white font-mono">400</span></div>
+          <div className="flex justify-between"><span>Vectors (pgvector)</span><span className="text-white font-mono">1.2M</span></div>
+          <div className="flex justify-between"><span>p99 vector query</span><span className="text-emerald-300 font-mono">38 ms</span></div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function LiveQueryPanel(){
+  const stages = [
+    { name:"Episodic Retrieval", detail:"pgvector top-k=10, HNSW", ms:18 },
+    { name:"Graph Traversal",    detail:"3-hop Cypher on Neo4j GDS", ms:48 },
+    { name:"Kusto Telemetry",    detail:"CPU/memory series last 1h", ms:210 },
+    { name:"Multi-Hop Reasoning",detail:"join episodes + graph path + signals", ms:90 },
+    { name:"LLM Synthesis",      detail:"GPT-4, KV cache hit 71%", ms:380 },
+    { name:"Memory Store",       detail:"encode → index → persist", ms:60 },
+  ];
+  const [active,setActive] = useState(-1);
+  const [running,setRunning] = useState(false);
+  const run = ()=>{
+    setRunning(true); setActive(-1);
+    stages.forEach((_,i)=>setTimeout(()=>setActive(i), i*550));
+    setTimeout(()=>setRunning(false), stages.length*550+200);
+  };
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h3 className="font-semibold text-white">Live Query Pipeline</h3>
+          <p className="text-xs text-slate-400">Q: "Why did ServiceA fail and what's the blast radius?"</p>
+        </div>
+        <button onClick={run} disabled={running}
+          className="px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-semibold">
+          {running?"Running…":"Execute"}
+        </button>
+      </div>
+      <div className="space-y-2">
+        {stages.map((s,i)=>{
+          const done = active>i, cur = active===i;
+          return (
+            <div key={i} className={`flex items-center gap-3 p-3 rounded-lg border transition-all
+              ${cur?"border-violet-500 bg-violet-500/10":done?"border-emerald-500/40 bg-emerald-500/5":"border-slate-800 bg-slate-900/40"}`}>
+              <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold
+                ${done?"bg-emerald-500 text-white":cur?"bg-violet-500 text-white pulse-dot":"bg-slate-800 text-slate-400"}`}>
+                {done?"✓":i+1}
+              </div>
+              <div className="flex-1">
+                <div className="text-sm text-white font-medium">{s.name}</div>
+                <div className="text-xs text-slate-400">{s.detail}</div>
+              </div>
+              <span className="text-xs font-mono text-slate-300">{s.ms} ms</span>
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function GraphMemoryPanel(){
+  const nodes = [
+    { id:"INC-456",   x:80,  y:60,  color:"#ef4444", shape:"incident" },
+    { id:"ServiceA",  x:260, y:60,  color:"#06b6d4" },
+    { id:"ServiceB",  x:440, y:60,  color:"#06b6d4" },
+    { id:"HighCPU",   x:620, y:60,  color:"#f59e0b", shape:"cause" },
+    { id:"ServiceC",  x:260, y:220, color:"#06b6d4" },
+    { id:"INC-789",   x:80,  y:220, color:"#ef4444", shape:"incident" },
+  ];
+  const edges = [
+    { from:"INC-456", to:"ServiceA", label:"AFFECTS" },
+    { from:"ServiceA", to:"ServiceB", label:"DEPENDS_ON" },
+    { from:"ServiceB", to:"HighCPU", label:"CAUSED_BY" },
+    { from:"INC-789", to:"ServiceC", label:"AFFECTS" },
+    { from:"ServiceC", to:"ServiceB", label:"DEPENDS_ON" },
+  ];
+  const path = ["INC-456","ServiceA","ServiceB","HighCPU"];
+  const [step,setStep] = useState(0);
+  useEffect(()=>{ const t = setInterval(()=>setStep(s=>(s+1)%(path.length+1)),1200); return ()=>clearInterval(t); },[]);
+  const nodeOf = id => nodes.find(n=>n.id===id);
+  const litEdges = new Set();
+  for(let i=0;i<step;i++) litEdges.add(path[i]+"→"+path[i+1]);
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="font-semibold text-white">Graph Memory — Multi-Hop Traversal</h3>
+        <Chip color="purple">animated 3-hop</Chip>
+      </div>
+      <svg viewBox="0 0 720 300" className="w-full h-[300px]">
+        <defs>
+          <marker id="am" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/>
+          </marker>
+          <marker id="amlit" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#a78bfa"/>
+          </marker>
+        </defs>
+        {edges.map((e,i)=>{
+          const a=nodeOf(e.from), b=nodeOf(e.to);
+          const lit = litEdges.has(e.from+"→"+e.to);
+          return (
+            <g key={i}>
+              <line x1={a.x+30} y1={a.y} x2={b.x-30} y2={b.y}
+                stroke={lit?"#a78bfa":"#475569"} strokeWidth={lit?2.5:1.5}
+                markerEnd={lit?"url(#amlit)":"url(#am)"} className={lit?"flow-dash":""}/>
+              <text x={(a.x+b.x)/2} y={(a.y+b.y)/2-6} textAnchor="middle"
+                fill={lit?"#c4b5fd":"#94a3b8"} fontSize="10">{e.label}</text>
+            </g>
+          );
+        })}
+        {nodes.map(n=>(
+          <g key={n.id}>
+            <circle cx={n.x} cy={n.y} r="28" fill={n.color+"33"} stroke={n.color} strokeWidth="2"/>
+            <text x={n.x} y={n.y+4} textAnchor="middle" fill="#fff" fontSize="10" fontWeight="600">{n.id}</text>
+          </g>
+        ))}
+      </svg>
+      <div className="mt-3 text-xs text-slate-400 font-mono">
+        path: {path.slice(0,step+1).join(" → ") || "(idle)"}
+      </div>
+    </Card>
+  );
+}
+
+function EpisodicPanel(){
+  const [q,setQ] = useState("");
+  const [tag,setTag] = useState("ALL");
+  const filtered = EPISODES.filter(e=>
+    (tag==="ALL"||e.tag===tag) &&
+    (q===""||JSON.stringify(e).toLowerCase().includes(q.toLowerCase()))
+  );
+  const tagColor = t => t==="RCA"?"green":t==="RETRIEVAL"?"blue":"amber";
+  return (
+    <Card>
+      <div className="flex flex-wrap gap-3 items-center mb-4">
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder="search episodes…"
+          className="flex-1 min-w-[200px] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white"/>
+        <div className="flex gap-1">
+          {["ALL","RCA","RETRIEVAL","REGRESSION"].map(t=>
+            <button key={t} onClick={()=>setTag(t)}
+              className={`px-3 py-1.5 rounded-md text-xs font-semibold ${tag===t?"bg-violet-600 text-white":"bg-slate-800 text-slate-300"}`}>{t}</button>)}
+        </div>
+      </div>
+      <div className="grid md:grid-cols-2 gap-3">
+        {filtered.map(e=>(
+          <div key={e.id} className="border border-slate-800 rounded-lg p-4 bg-slate-900/40">
+            <div className="flex justify-between mb-2">
+              <div className="font-mono text-xs text-slate-400">{e.id} · {e.incident}</div>
+              <Chip color={tagColor(e.tag)}>{e.tag}</Chip>
+            </div>
+            <div className="text-sm text-white font-medium mb-1">{e.query}</div>
+            <div className="text-xs text-slate-400 font-mono mb-3 break-words">{e.hop_path}</div>
+            <div className="text-xs text-slate-300 mb-3">{e.outcome}</div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400">confidence</span>
+              <div className="flex-1"><Bar value={e.confidence} max={1}
+                color={e.confidence>=0.9?"#10b981":e.confidence>=0.8?"#06b6d4":"#f59e0b"}/></div>
+              <span className="text-xs font-mono text-white">{e.confidence.toFixed(2)}</span>
+            </div>
+            <div className="text-[11px] text-slate-500 mt-2">hops: {e.hops}</div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function KustoPanel(){
+  const stages = [
+    { name:"Kusto Ingest",       pct:100 },
+    { name:"Schema Transform",   pct:85 },
+    { name:"Graph Merge",        pct:62 },
+    { name:"Memory Integration", pct:41 },
+  ];
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      <Card className="col-span-12 lg:col-span-7">
+        <h3 className="font-semibold text-white mb-3">Ingestion Pipeline</h3>
+        <div className="space-y-3">
+          {stages.map((s,i)=>(
+            <div key={i}>
+              <div className="flex justify-between text-sm mb-1">
+                <span className="text-slate-200">{i+1}. {s.name}</span>
+                <span className="font-mono text-slate-400">{s.pct}%</span>
+              </div>
+              <Bar value={s.pct} max={100} color={["#7c3aed","#06b6d4","#10b981","#f59e0b"][i]}/>
+            </div>
+          ))}
+        </div>
+      </Card>
+      <Card className="col-span-12 lg:col-span-5">
+        <h3 className="font-semibold text-white mb-2">Source · KQL</h3>
+        <pre className="text-xs bg-slate-950 border border-slate-800 rounded-lg p-3 text-emerald-300 overflow-x-auto scroll-thin">
+{`Incidents
+| where CreatedDate > ago(7d)
+| project IncidentId, Title, AffectedService, Severity, CreatedDate
+| order by CreatedDate desc
+| take 400`}</pre>
+        <h3 className="font-semibold text-white mt-4 mb-2">Transform · Cypher MERGE</h3>
+        <pre className="text-xs bg-slate-950 border border-slate-800 rounded-lg p-3 text-cyan-300 overflow-x-auto scroll-thin">
+{`MERGE (i:Incident {id:$IncidentId})
+MERGE (s:Service {name:$AffectedService})
+MERGE (i)-[:AFFECTS]->(s)`}</pre>
+      </Card>
+    </div>
+  );
+}
+
+/* =========================================================
+   PART II — EXTENDED
+   ========================================================= */
+
+function ReasoningChainPanel(){
+  const seeds = {
+    "INC-456":[
+      { rel:"AFFECTS", target:"ServiceA" },
+      { rel:"DEPENDS_ON", target:"ServiceB" },
+      { rel:"CAUSED_BY", target:"HighCPU" },
+    ],
+    "INC-789":[
+      { rel:"AFFECTS", target:"ServiceC" },
+      { rel:"DEPENDS_ON", target:"DbService" },
+      { rel:"CAUSED_BY", target:"ConnPoolExhaustion" },
+    ],
+    "INC-234":[
+      { rel:"AFFECTS", target:"DbService" },
+      { rel:"DEPENDS_ON", target:"ConnPool" },
+      { rel:"CAUSED_BY", target:"OvernightBatch" },
+    ],
+    "INC-901":[
+      { rel:"INTRODUCED_BY", target:"v2.3.1" },
+      { rel:"CONTAINS", target:"MemLeak" },
+    ],
+  };
+  const [seed,setSeed] = useState("INC-456");
+  const [step,setStep] = useState(0);
+  const hops = seeds[seed];
+  const run = ()=>{
+    setStep(0);
+    hops.forEach((_,i)=>setTimeout(()=>setStep(i+1),(i+1)*700));
+  };
+  const cypher = `MATCH (i:Incident {id:"${seed}"})\n` +
+    hops.map((h,i)=>`  -[:${h.rel}]->(n${i})`).join("\n")+
+    `\nRETURN i, ${hops.map((_,i)=>"n"+i).join(", ")}`;
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      <Card className="col-span-12 lg:col-span-7">
+        <div className="flex items-center gap-3 mb-4">
+          <span className="text-sm text-slate-300">Seed:</span>
+          <select value={seed} onChange={e=>{setSeed(e.target.value);setStep(0);}}
+            className="bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-sm text-white">
+            {Object.keys(seeds).map(k=><option key={k}>{k}</option>)}
+          </select>
+          <button onClick={run} className="px-3 py-1.5 rounded-md bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold">Execute traversal</button>
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <div className="w-10 h-10 rounded-full bg-rose-500/20 border-2 border-rose-500 flex items-center justify-center text-xs font-bold text-white">{seed.split("-")[1]}</div>
+            <span className="text-sm text-white font-semibold">{seed}</span>
+          </div>
+          {hops.map((h,i)=>(
+            <div key={i} className={`ml-5 pl-4 border-l-2 ${step>i?"border-violet-500":"border-slate-700"}`}>
+              <div className="text-[11px] font-mono text-slate-400 py-1">↓ [:{h.rel}]</div>
+              <div className={`flex items-center gap-2 transition-opacity ${step>i?"opacity-100":"opacity-30"}`}>
+                <div className="w-10 h-10 rounded-full bg-cyan-500/20 border-2 border-cyan-500 flex items-center justify-center text-[10px] font-bold text-white">n{i}</div>
+                <span className="text-sm text-white">{h.target}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Card>
+      <Card className="col-span-12 lg:col-span-5">
+        <h3 className="font-semibold text-white mb-2">Generated Cypher</h3>
+        <pre className="text-xs bg-slate-950 border border-slate-800 rounded-lg p-3 text-cyan-300 overflow-x-auto scroll-thin">{cypher}</pre>
+        <div className="mt-3 text-xs text-slate-400">
+          Depth: {hops.length} · Step: {step}/{hops.length}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function NLCypherPanel(){
+  const [sel,setSel] = useState(0);
+  const t = NL_TEMPLATES[sel];
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      <Card className="col-span-12 lg:col-span-4">
+        <h3 className="font-semibold text-white mb-3">Templates</h3>
+        <div className="space-y-2">
+          {NL_TEMPLATES.map((x,i)=>(
+            <button key={i} onClick={()=>setSel(i)}
+              className={`w-full text-left p-3 rounded-lg text-sm border transition-colors
+                ${sel===i?"border-violet-500 bg-violet-500/10 text-white":"border-slate-800 bg-slate-900/40 text-slate-300 hover:bg-slate-800/50"}`}>
+              {x.nl}
+            </button>
+          ))}
+        </div>
+      </Card>
+      <Card className="col-span-12 lg:col-span-8">
+        <div className="text-xs text-slate-400 mb-1">Natural language</div>
+        <div className="text-sm text-white mb-4">"{t.nl}"</div>
+        <div className="text-xs text-slate-400 mb-1">Generated Cypher</div>
+        <pre className="text-xs bg-slate-950 border border-slate-800 rounded-lg p-3 text-cyan-300 overflow-x-auto scroll-thin mb-4">{t.cypher}</pre>
+        <div className="text-xs text-slate-400 mb-2">Result rows</div>
+        <div className="border border-slate-800 rounded-lg overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-900"><tr>{Object.keys(t.rows[0]).map(k=>
+              <th key={k} className="text-left px-3 py-2 text-slate-400 font-medium">{k}</th>)}</tr></thead>
+            <tbody>{t.rows.map((r,i)=>
+              <tr key={i} className="border-t border-slate-800"><>{Object.values(r).map((v,j)=>
+                <td key={j} className="px-3 py-2 text-slate-200 font-mono">{String(v)}</td>)}</></tr>)}</tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function ServiceMapPanel(){
+  const layout = useMemo(()=>{
+    const rows = [SERVICES.API, SERVICES.Platform, SERVICES.Data];
+    const coords = {};
+    rows.forEach((row,ri)=>{
+      row.forEach((name,ci)=>{
+        const spacing = 720/(row.length+1);
+        coords[name] = { x: spacing*(ci+1), y: 70 + ri*130, tier:["API","Platform","Data"][ri] };
+      });
+    });
+    return coords;
+  },[]);
+  const deps = [
+    ["ApiGateway","ServiceA"],["ApiGateway","ServiceC"],["AuthService","ServiceA"],
+    ["BillingAPI","PaymentProc"],["NotifyAPI","MsgBroker"],
+    ["ServiceA","ServiceB"],["ServiceA","DbService"],["ServiceA","CacheLayer"],
+    ["ServiceB","DbService"],["ServiceC","DbService"],["ServiceC","SearchSvc"],
+    ["PaymentProc","DbService"],["SearchSvc","IndexStore"],["MsgBroker","QueueStore"],
+    ["ServiceB","VectorDB"],["ServiceC","GraphDB"],["ServiceA","BlobStore"],
+  ];
+  const [sel,setSel] = useState("ServiceA");
+  const tierColor = { API:"#06b6d4", Platform:"#7c3aed", Data:"#10b981" };
+  const deg = ALL_SERVICES.reduce((acc,s)=>{acc[s]=0;return acc;},{});
+  deps.forEach(([a,b])=>{ deg[a]=(deg[a]||0)+1; deg[b]=(deg[b]||0)+1; });
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      <Card className="col-span-12 lg:col-span-9">
+        <h3 className="font-semibold text-white mb-2">18-Service Topology</h3>
+        <svg viewBox="0 0 720 440" className="w-full h-[440px]">
+          <defs>
+            <marker id="svc-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#475569"/>
+            </marker>
+            <marker id="svc-sel" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#a78bfa"/>
+            </marker>
+          </defs>
+          {["API","Platform","Data"].map((t,i)=>(
+            <text key={t} x="12" y={78+i*130} fill="#64748b" fontSize="11" fontWeight="700">{t.toUpperCase()}</text>
+          ))}
+          {deps.map(([a,b],i)=>{
+            const A=layout[a], B=layout[b];
+            const hit = sel===a||sel===b;
+            return <line key={i} x1={A.x} y1={A.y} x2={B.x} y2={B.y}
+              stroke={hit?"#a78bfa":"#334155"} strokeWidth={hit?2:1}
+              markerEnd={hit?"url(#svc-sel)":"url(#svc-arrow)"} className={hit?"flow-dash":""}/>;
+          })}
+          {Object.entries(layout).map(([name,c])=>(
+            <g key={name} onClick={()=>setSel(name)} style={{cursor:"pointer"}}>
+              <circle cx={c.x} cy={c.y} r={sel===name?22:18}
+                fill={tierColor[c.tier]+"33"} stroke={tierColor[c.tier]} strokeWidth={sel===name?2.5:1.5}/>
+              <text x={c.x} y={c.y+32} textAnchor="middle" fill="#cbd5e1" fontSize="9" fontWeight="600">{name}</text>
+            </g>
+          ))}
+        </svg>
+      </Card>
+      <Card className="col-span-12 lg:col-span-3">
+        <div className="text-xs text-slate-400 mb-1">Selected</div>
+        <div className="text-lg font-semibold text-white">{sel}</div>
+        <div className="mt-3 space-y-1 text-sm">
+          <div className="flex justify-between"><span className="text-slate-400">Tier</span><span className="text-white">{layout[sel].tier}</span></div>
+          <div className="flex justify-between"><span className="text-slate-400">Degree</span><span className="text-white font-mono">{deg[sel]||0}</span></div>
+          <div className="flex justify-between"><span className="text-slate-400">Health</span><span className="text-emerald-300">healthy</span></div>
+          <div className="flex justify-between"><span className="text-slate-400">SLA</span><span className="text-white font-mono">99.95%</span></div>
+        </div>
+        <div className="mt-4 text-xs text-slate-400">Direct dependents</div>
+        <div className="mt-1 flex flex-wrap gap-1">
+          {deps.filter(([a])=>a===sel).map(([,b],i)=><Chip key={i} color="purple">{b}</Chip>)}
+          {deps.filter(([a])=>a===sel).length===0 && <span className="text-xs text-slate-500">none</span>}
+        </div>
+        <div className="mt-3 text-xs text-slate-400">Depends on</div>
+        <div className="mt-1 flex flex-wrap gap-1">
+          {deps.filter(([,b])=>b===sel).map(([a],i)=><Chip key={i} color="blue">{a}</Chip>)}
+          {deps.filter(([,b])=>b===sel).length===0 && <span className="text-xs text-slate-500">none</span>}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function LifecyclePanel(){
+  const phases = [
+    { k:"ENC", name:"Encode",   color:"#7c3aed" },
+    { k:"STR", name:"Store",    color:"#06b6d4" },
+    { k:"RET", name:"Retrieve", color:"#10b981" },
+    { k:"RSN", name:"Reason",   color:"#f59e0b" },
+    { k:"UPD", name:"Update",   color:"#ec4899" },
+    { k:"FGT", name:"Forget",   color:"#64748b" },
+  ];
+  const [threshold,setThreshold] = useState(0.75);
+  const [stats,setStats] = useState({enc:0,str:0,ret:0,rsn:0,upd:0,fgt:0});
+  useEffect(()=>{
+    const t = setInterval(()=>setStats(s=>({
+      enc:s.enc+Math.floor(Math.random()*4)+1,
+      str:s.str+Math.floor(Math.random()*3)+1,
+      ret:s.ret+Math.floor(Math.random()*6)+2,
+      rsn:s.rsn+Math.floor(Math.random()*4)+1,
+      upd:s.upd+Math.floor(Math.random()*2),
+      fgt:s.fgt+(Math.random()<threshold?1:0),
+    })),900);
+    return ()=>clearInterval(t);
+  },[threshold]);
+  const keys = ["enc","str","ret","rsn","upd","fgt"];
+  return (
+    <Card>
+      <h3 className="font-semibold text-white mb-4">6-Phase Memory Lifecycle</h3>
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-5">
+        {phases.map((p,i)=>(
+          <div key={p.k} className="border border-slate-800 rounded-lg p-3 bg-slate-900/40 text-center">
+            <div className="text-[10px] font-bold tracking-wider" style={{color:p.color}}>{p.k}</div>
+            <div className="text-sm text-white font-semibold">{p.name}</div>
+            <div className="mt-2 text-2xl font-mono text-white">{stats[keys[i]]}</div>
+            <div className="text-[10px] text-slate-500">events</div>
+          </div>
+        ))}
+      </div>
+      <div className="border border-slate-800 rounded-lg p-4 bg-slate-900/40">
+        <div className="flex justify-between mb-2">
+          <span className="text-sm text-slate-200">Pruning (Forget) threshold — confidence gate</span>
+          <span className="font-mono text-white text-sm">{threshold.toFixed(2)}</span>
+        </div>
+        <input type="range" min="0" max="1" step="0.01" value={threshold}
+          onChange={e=>setThreshold(parseFloat(e.target.value))} className="w-full"/>
+        <div className="text-xs text-slate-400 mt-2">
+          Episodes with confidence &lt; {threshold.toFixed(2)} are candidates for forgetting.
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function AuditPanel(){
+  const SUBS = ["Memory","Graph","Kusto","LLM"];
+  const [filter,setFilter] = useState("ALL");
+  const [events,setEvents] = useState([
+    { t:"10:02:14", sub:"Kusto", msg:"pulled 400 incidents from ADE cluster" },
+    { t:"10:02:16", sub:"Graph", msg:"MERGE 400 :Incident + 18 :Service (idempotent)" },
+    { t:"10:02:18", sub:"Memory",msg:"encoded 400 episodes → pgvector (HNSW)" },
+    { t:"10:02:20", sub:"LLM",   msg:"KV cache hit prefix=4200 toks, synthesis 380ms" },
+    { t:"10:02:21", sub:"Graph", msg:"3-hop traversal on INC-456 completed in 48ms" },
+    { t:"10:02:23", sub:"Memory",msg:"ep-004 confidence 0.78 → kept (>= 0.75 gate)" },
+    { t:"10:02:25", sub:"Kusto", msg:"telemetry window [now-1h..now] returned 1.3k pts" },
+    { t:"10:02:27", sub:"LLM",   msg:"refused request — AML.T0051 prompt injection" },
+  ]);
+  useEffect(()=>{
+    const t = setInterval(()=>{
+      const sub = SUBS[Math.floor(Math.random()*SUBS.length)];
+      const msgs = {
+        Memory:["encoded new episode","retrieved top-10 similar","pruned low-conf episode"],
+        Graph:["Cypher MATCH 3-hop","merged new edge","detected cycle"],
+        Kusto:["KQL exec 120ms","ingested 12 rows","telemetry stream open"],
+        LLM:["synthesis 412ms","KV cache hit","tokens 1,240"],
+      };
+      const now = new Date();
+      const ts = now.toTimeString().slice(0,8);
+      setEvents(e=>[{t:ts,sub,msg:msgs[sub][Math.floor(Math.random()*3)]},...e].slice(0,40));
+    },1800);
+    return ()=>clearInterval(t);
+  },[]);
+  const color = s => s==="Memory"?"purple":s==="Graph"?"blue":s==="Kusto"?"green":"amber";
+  const filtered = events.filter(e=>filter==="ALL"||e.sub===filter);
+  return (
+    <Card>
+      <div className="flex gap-2 mb-4">
+        {["ALL",...SUBS].map(s=>
+          <button key={s} onClick={()=>setFilter(s)}
+            className={`px-3 py-1.5 rounded-md text-xs font-semibold ${filter===s?"bg-violet-600 text-white":"bg-slate-800 text-slate-300"}`}>{s}</button>)}
+      </div>
+      <div className="border border-slate-800 rounded-lg bg-slate-950 max-h-[500px] overflow-y-auto scroll-thin">
+        {filtered.map((e,i)=>(
+          <div key={i} className="flex items-center gap-3 px-3 py-2 border-b border-slate-900 text-sm">
+            <span className="font-mono text-xs text-slate-500 w-20">{e.t}</span>
+            <Chip color={color(e.sub)}>{e.sub}</Chip>
+            <span className="text-slate-200 flex-1">{e.msg}</span>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+/* =========================================================
+   PART III — ADVANCED
+   ========================================================= */
+
+function AgentChatPanel(){
+  const [msgs,setMsgs] = useState([
+    { role:"sys", text:"Claude-powered IcM assistant. Full graph context (18 services, 43 rel types, 127 edges) + 400 episodes injected via system prompt." },
+    { role:"asst", text:"Hi — ask me about any incident, service, or root cause. I'll traverse the graph and cite episode IDs." },
+  ]);
+  const [input,setInput] = useState("");
+  const presets = [
+    "Why did ServiceA fail in INC-456?",
+    "What's the blast radius of DbService?",
+    "Any regressions introduced in the last 7 days?",
+    "Cycle detection on Platform tier",
+  ];
+  const canned = {
+    "Why did ServiceA fail in INC-456?":
+      "Per episode ep-001 (confidence 0.94): INC-456 →[AFFECTS]→ ServiceA →[DEPENDS_ON]→ ServiceB →[CAUSED_BY]→ HighCPU. ServiceB hit CPU saturation; mitigate with restart + autoscale @ 80% + circuit breaker on ServiceA→ServiceB.",
+    "What's the blast radius of DbService?":
+      "1-hop: ServiceB, ServiceC, BillingAPI, PaymentProc. 2-hop: ApiGateway, AuthService (via ServiceA). Recommend: connection pool ≥50 and circuit breakers on all downstream edges (see ep-003).",
+    "Any regressions introduced in the last 7 days?":
+      "1 hit — INC-901 →[INTRODUCED_BY]→ v2.3.1 →[CONTAINS]→ MemLeak (AuthService). Action taken: rollback to v2.3.0 (ep-004, conf 0.78).",
+    "Cycle detection on Platform tier":
+      "No cycles detected in :DEPENDS_ON at depths 2..8. Graph is a DAG on Platform. (1.9ms, Neo4j GDS).",
+  };
+  const send = text => {
+    if(!text.trim()) return;
+    setMsgs(m=>[...m,{role:"user",text}]);
+    setInput("");
+    setTimeout(()=>{
+      const r = canned[text] || "Traversing graph… (demo: preset responses are wired; hook a real Claude call at `/api/chat`).";
+      setMsgs(m=>[...m,{role:"asst",text:r}]);
+    },500);
+  };
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      <Card className="col-span-12 lg:col-span-9">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-semibold text-white">IcM Agent Chat</h3>
+          <Chip color="green">claude-sonnet-4-6</Chip>
+        </div>
+        <div className="border border-slate-800 rounded-lg bg-slate-950 p-3 h-[420px] overflow-y-auto scroll-thin space-y-3">
+          {msgs.map((m,i)=>(
+            <div key={i} className={`flex ${m.role==="user"?"justify-end":"justify-start"}`}>
+              <div className={`max-w-[80%] px-3 py-2 rounded-lg text-sm
+                ${m.role==="user"?"bg-violet-600 text-white":
+                  m.role==="sys"?"bg-slate-800/50 text-slate-400 text-xs italic":"bg-slate-800 text-slate-100"}`}>
+                {m.text}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-3 flex gap-2">
+          <input value={input} onChange={e=>setInput(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&send(input)}
+            placeholder="ask about any incident, service or root cause…"
+            className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white"/>
+          <button onClick={()=>send(input)} className="px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-sm font-semibold">Send</button>
+        </div>
+      </Card>
+      <Card className="col-span-12 lg:col-span-3">
+        <h3 className="font-semibold text-white mb-2">Preset queries</h3>
+        <div className="space-y-2">
+          {presets.map(p=>
+            <button key={p} onClick={()=>send(p)}
+              className="w-full text-left text-xs px-3 py-2 rounded-md border border-slate-800 bg-slate-900/50 hover:bg-slate-800 text-slate-300">{p}</button>)}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function SQLImpossiblePanel(){
+  return (
+    <div className="grid md:grid-cols-2 gap-3">
+      {SQL_VS_CYPHER.map((x,i)=>(
+        <details key={i} className="border border-slate-800 rounded-lg bg-slate-900/40 p-3" open={i<2}>
+          <summary className="flex justify-between items-center">
+            <span className="text-sm font-semibold text-white">{x.title}</span>
+            <Chip color="purple">compare</Chip>
+          </summary>
+          <div className="mt-3 grid md:grid-cols-2 gap-2">
+            <div>
+              <div className="text-[10px] text-cyan-400 font-semibold mb-1">CYPHER</div>
+              <pre className="text-[11px] bg-slate-950 border border-slate-800 rounded p-2 text-cyan-300 overflow-x-auto scroll-thin">{x.cypher}</pre>
+            </div>
+            <div>
+              <div className="text-[10px] text-rose-400 font-semibold mb-1">SQL</div>
+              <pre className="text-[11px] bg-slate-950 border border-slate-800 rounded p-2 text-rose-300 overflow-x-auto scroll-thin">{x.sql}</pre>
+            </div>
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
+function SchemaExplorerPanel(){
+  const [sel,setSel] = useState("Incident");
+  const e = SCHEMA_ENTITIES.find(x=>x.name===sel);
+  const positions = {
+    Incident:{x:150,y:80}, Service:{x:400,y:80}, RootCause:{x:650,y:80},
+    Team:{x:400,y:260},    Alert:{x:150,y:260},  Deployment:{x:650,y:260},
+  };
+  const rels = [
+    ["Incident","Service","AFFECTS"],
+    ["Service","Service","DEPENDS_ON"],
+    ["Service","RootCause","CAUSED_BY"],
+    ["Team","Service","OWNS"],
+    ["Alert","Incident","TRIGGERS"],
+    ["Incident","Deployment","INTRODUCED_BY"],
+  ];
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      <Card className="col-span-12 lg:col-span-8">
+        <h3 className="font-semibold text-white mb-2">Entity-Relationship</h3>
+        <svg viewBox="0 0 800 360" className="w-full h-[360px]">
+          <defs>
+            <marker id="er-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+              <path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/>
+            </marker>
+          </defs>
+          {rels.map(([a,b,label],i)=>{
+            if(a===b){
+              const p = positions[a];
+              return (
+                <g key={i}>
+                  <path d={`M ${p.x-35} ${p.y-20} C ${p.x-80} ${p.y-70}, ${p.x+80} ${p.y-70}, ${p.x+35} ${p.y-20}`}
+                    stroke="#475569" fill="none" strokeWidth="1.5" markerEnd="url(#er-arrow)"/>
+                  <text x={p.x} y={p.y-55} textAnchor="middle" fill="#94a3b8" fontSize="10">{label}</text>
+                </g>
+              );
+            }
+            const A=positions[a],B=positions[b];
+            return (
+              <g key={i}>
+                <line x1={A.x} y1={A.y} x2={B.x} y2={B.y} stroke="#475569" strokeWidth="1.5" markerEnd="url(#er-arrow)"/>
+                <text x={(A.x+B.x)/2} y={(A.y+B.y)/2-6} textAnchor="middle" fill="#94a3b8" fontSize="10">{label}</text>
+              </g>
+            );
+          })}
+          {SCHEMA_ENTITIES.map(ent=>{
+            const p=positions[ent.name];
+            return (
+              <g key={ent.name} onClick={()=>setSel(ent.name)} style={{cursor:"pointer"}}>
+                <rect x={p.x-60} y={p.y-22} width="120" height="44" rx="8"
+                  fill={ent.color+(sel===ent.name?"44":"22")} stroke={ent.color} strokeWidth={sel===ent.name?2.5:1.5}/>
+                <text x={p.x} y={p.y+5} textAnchor="middle" fill="#fff" fontSize="12" fontWeight="700">{ent.name}</text>
+              </g>
+            );
+          })}
+        </svg>
+      </Card>
+      <Card className="col-span-12 lg:col-span-4">
+        <div className="text-xs text-slate-400 mb-1">Entity</div>
+        <div className="text-lg font-semibold text-white flex items-center gap-2">
+          <span className="w-3 h-3 rounded-full" style={{background:e.color}}/> {e.name}
+        </div>
+        <div className="mt-4 text-xs text-slate-400 mb-1">Properties</div>
+        <div className="flex flex-wrap gap-1">{e.props.map(p=><Chip key={p}>{p}</Chip>)}</div>
+        <div className="mt-3 text-xs text-slate-400 mb-1">Indexes</div>
+        <div className="flex flex-wrap gap-1">{e.idx.map(p=><Chip key={p} color="amber">{p}</Chip>)}</div>
+      </Card>
+    </div>
+  );
+}
+
+function GuardrailsPanel(){
+  const cats = ["ALL",...Array.from(new Set(ATLAS.map(a=>a.cat)))];
+  const [cat,setCat] = useState("ALL");
+  const rows = ATLAS.filter(a=>cat==="ALL"||a.cat===cat);
+  const riskColor = r => r==="High"?"red":r==="Medium"?"amber":"green";
+  const statusColor = s => s==="Mitigated"?"green":"amber";
+  return (
+    <Card>
+      <div className="flex flex-wrap gap-2 mb-4">
+        {cats.map(c=>
+          <button key={c} onClick={()=>setCat(c)}
+            className={`px-3 py-1.5 rounded-md text-xs font-semibold ${cat===c?"bg-violet-600 text-white":"bg-slate-800 text-slate-300"}`}>{c}</button>)}
+      </div>
+      <div className="border border-slate-800 rounded-lg overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-900 text-slate-400 text-xs">
+            <tr><th className="text-left px-3 py-2">ATLAS ID</th>
+                <th className="text-left px-3 py-2">Attack</th>
+                <th className="text-left px-3 py-2">Category</th>
+                <th className="text-left px-3 py-2">Risk</th>
+                <th className="text-left px-3 py-2">Status</th></tr>
+          </thead>
+          <tbody>{rows.map(a=>(
+            <tr key={a.id} className="border-t border-slate-800">
+              <td className="px-3 py-2 font-mono text-xs text-violet-300">{a.id}</td>
+              <td className="px-3 py-2 text-slate-200">{a.attack}</td>
+              <td className="px-3 py-2"><Chip>{a.cat}</Chip></td>
+              <td className="px-3 py-2"><Chip color={riskColor(a.risk)}>{a.risk}</Chip></td>
+              <td className="px-3 py-2"><Chip color={statusColor(a.status)}>{a.status}</Chip></td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+      <div className="mt-4 text-xs text-slate-400">
+        Key controls: confidence gating (min 0.75) · schema validation on MERGE · hash-verified MCP tool descriptions · 6-hop depth limit · 5s query timeout · RBAC scoping via Azure AD.
+      </div>
+    </Card>
+  );
+}
+
+function PerformancePanel(){
+  const max = Math.max(...PERF.map(p=>p.ms));
+  const [hit,setHit] = useState(71);
+  const [bench,setBench] = useState(null);
+  const runBench = ()=>{
+    setBench({running:true});
+    setTimeout(()=>{
+      const cached = 670 * (1 - (hit-71)/200);
+      const cold = 1820;
+      setBench({running:false, cached:Math.round(cached), cold, p99:Math.round(cached*1.35)});
+    }, 800);
+  };
+  return (
+    <div className="grid grid-cols-12 gap-4">
+      <Card className="col-span-12 lg:col-span-7">
+        <h3 className="font-semibold text-white mb-3">Latency Breakdown</h3>
+        <div className="space-y-2">
+          {PERF.map((p,i)=>(
+            <div key={i}>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-slate-300">{p.label} {p.note && <span className="text-slate-500">· {p.note}</span>}</span>
+                <span className="font-mono text-white">{p.ms} ms</span>
+              </div>
+              <Bar value={p.ms} max={max} color={p.label.includes("cold")?"#ef4444":p.label.includes("cached")?"#10b981":"#06b6d4"}/>
+            </div>
+          ))}
+        </div>
+      </Card>
+      <Card className="col-span-12 lg:col-span-5">
+        <h3 className="font-semibold text-white mb-3">KV Cache Simulator</h3>
+        <div className="flex justify-between text-sm mb-1">
+          <span className="text-slate-300">Prefix hit rate</span>
+          <span className="font-mono text-white">{hit}%</span>
+        </div>
+        <input type="range" min="0" max="100" value={hit} onChange={e=>setHit(parseInt(e.target.value))} className="w-full"/>
+        <div className="text-xs text-slate-400 mt-1">
+          Shared IcM prefix ≈ 4,200 tokens. Token cost multiplier ≈ {(1-(hit/100)*0.46).toFixed(2)}×.
+        </div>
+        <button onClick={runBench} className="mt-4 px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-sm font-semibold">
+          {bench?.running?"Running…":"Run benchmark"}
+        </button>
+        {bench && !bench.running && (
+          <div className="mt-4 grid grid-cols-3 gap-2 text-center">
+            <div className="border border-slate-800 rounded p-2">
+              <div className="text-[10px] text-slate-400">cached</div>
+              <div className="text-lg font-mono text-emerald-300">{bench.cached}ms</div>
+            </div>
+            <div className="border border-slate-800 rounded p-2">
+              <div className="text-[10px] text-slate-400">cold</div>
+              <div className="text-lg font-mono text-rose-300">{bench.cold}ms</div>
+            </div>
+            <div className="border border-slate-800 rounded p-2">
+              <div className="text-[10px] text-slate-400">p99</div>
+              <div className="text-lg font-mono text-amber-300">{bench.p99}ms</div>
+            </div>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* =========================================================
+   SHELL
+   ========================================================= */
+
+const PARTS = {
+  "Core": [
+    { id:"arch",    label:"Architecture",    cmp:<ArchitecturePanel/> },
+    { id:"live",    label:"Live Query",      cmp:<LiveQueryPanel/> },
+    { id:"graph",   label:"Graph Memory",    cmp:<GraphMemoryPanel/> },
+    { id:"epi",     label:"Episodic",        cmp:<EpisodicPanel/> },
+    { id:"kusto",   label:"Kusto Pipeline",  cmp:<KustoPanel/> },
+  ],
+  "Extended": [
+    { id:"chain",   label:"Reasoning Chain", cmp:<ReasoningChainPanel/> },
+    { id:"nl",      label:"NL → Cypher",     cmp:<NLCypherPanel/> },
+    { id:"map",     label:"Service Map",     cmp:<ServiceMapPanel/> },
+    { id:"life",    label:"Lifecycle",       cmp:<LifecyclePanel/> },
+    { id:"audit",   label:"Audit Timeline",  cmp:<AuditPanel/> },
+  ],
+  "Advanced": [
+    { id:"chat",    label:"Agent Chat",      cmp:<AgentChatPanel/> },
+    { id:"sql",     label:"SQL Impossible",  cmp:<SQLImpossiblePanel/> },
+    { id:"schema",  label:"Schema Explorer", cmp:<SchemaExplorerPanel/> },
+    { id:"guard",   label:"Guardrails",      cmp:<GuardrailsPanel/> },
+    { id:"perf",    label:"Performance",     cmp:<PerformancePanel/> },
+  ],
+};
+
+function App(){
+  const [part,setPart] = useState("Core");
+  const [tab,setTab] = useState(PARTS["Core"][0].id);
+  const active = PARTS[part].find(t=>t.id===tab) || PARTS[part][0];
+  const switchPart = p => { setPart(p); setTab(PARTS[p][0].id); };
+
+  return (
+    <div className="min-h-screen">
+      {/* header */}
+      <header className="border-b border-slate-800 bg-slate-950/60 backdrop-blur sticky top-0 z-40">
+        <div className="max-w-7xl mx-auto px-5 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-lg grad-border flex items-center justify-center bg-slate-900">
+              <span className="text-lg">🧠</span>
+            </div>
+            <div>
+              <div className="text-white font-semibold leading-tight">GraphRAG + MemMachine</div>
+              <div className="text-[11px] text-slate-400 leading-tight">Hybrid Memory for Microsoft IcM · Kusto · Neo4j · pgvector</div>
+            </div>
+          </div>
+          <div className="hidden md:flex items-center gap-2">
+            <Chip color="green">18 svcs</Chip>
+            <Chip color="blue">43 rels</Chip>
+            <Chip color="purple">400 inc</Chip>
+            <Chip color="amber">1.2M vec</Chip>
+          </div>
+        </div>
+        {/* part tabs */}
+        <div className="max-w-7xl mx-auto px-5 flex gap-1">
+          {Object.keys(PARTS).map(p=>(
+            <button key={p} onClick={()=>switchPart(p)}
+              className={`px-4 py-2 text-sm font-semibold border-b-2 transition-colors
+                ${part===p?"border-violet-500 text-white":"border-transparent text-slate-400 hover:text-slate-200"}`}>
+              {p}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      {/* subtab strip */}
+      <div className="max-w-7xl mx-auto px-5 py-4">
+        <div className="flex flex-wrap gap-2 mb-5">
+          {PARTS[part].map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)}
+              className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors
+                ${tab===t.id?"bg-violet-600 text-white":"bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-800"}`}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+        {active.cmp}
+
+        <footer className="mt-10 text-center text-xs text-slate-500">
+          GraphRAG + MemMachine Hybrid · dev scaffold built with React 18 + Tailwind (CDN) · just open <code className="text-slate-300">index.html</code>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

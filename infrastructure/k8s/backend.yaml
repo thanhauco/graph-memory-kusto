@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: backend, namespace: icm-memory }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: backend } }
+  template:
+    metadata: { labels: { app: backend } }
+    spec:
+      containers:
+        - name: backend
+          image: icm/backend-dotnet:latest
+          env:
+            - { name: Neo4j__Uri,    value: bolt://neo4j:7687 }
+            - { name: Neo4j__User,   value: neo4j }
+            - { name: Neo4j__Pass,   value: neo4jpass }
+            - { name: Episodic__Dsn, value: "Host=postgres;Username=memuser;Password=mempass;Database=memdb" }
+            - { name: GraphRag__Url, value: http://graphrag:8000/chat }
+          ports: [ { containerPort: 8080 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: backend, namespace: icm-memory }
+spec:
+  selector: { app: backend }
+  ports: [ { port: 5000, targetPort: 8080 } ]

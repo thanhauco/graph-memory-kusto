@@ -1,0 +1,70 @@
+version: "3.9"
+
+# Local dev stack — §2 architecture
+# - Neo4j (graph)
+# - PostgreSQL + pgvector (episodic + vector)
+# - .NET backend (API)
+# - Next.js frontend
+# - Python GraphRAG agent (sidecar for /chat)
+#
+# Kusto is a managed Azure service — not containerized here. Ingestion runs
+# via `kusto-ingestion/kusto_to_neo4j.py` against the real ADX cluster.
+
+services:
+
+  neo4j:
+    image: neo4j:5.19
+    environment:
+      NEO4J_AUTH: neo4j/neo4jpass
+      NEO4J_PLUGINS: '["graph-data-science"]'
+    ports: ["7474:7474", "7687:7687"]
+    volumes: [ "neo4j-data:/data" ]
+
+  postgres:
+    image: ankane/pgvector:latest
+    environment:
+      POSTGRES_USER: memuser
+      POSTGRES_PASSWORD: mempass
+      POSTGRES_DB: memdb
+    ports: ["5432:5432"]
+    volumes: [ "pg-data:/var/lib/postgresql/data" ]
+
+  graphrag-agent:
+    build:
+      context: ..
+      dockerfile: infrastructure/Dockerfile.graphrag
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASS: neo4jpass
+      EPISODIC_DB_DSN: postgresql://memuser:mempass@postgres:5432/memdb
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+    ports: ["8000:8000"]
+    depends_on: [neo4j, postgres]
+
+  backend:
+    build:
+      context: ..
+      dockerfile: infrastructure/Dockerfile.backend
+    environment:
+      Neo4j__Uri: bolt://neo4j:7687
+      Neo4j__User: neo4j
+      Neo4j__Pass: neo4jpass
+      Episodic__Dsn: Host=postgres;Username=memuser;Password=mempass;Database=memdb
+      GraphRag__Url: http://graphrag-agent:8000/chat
+    ports: ["5000:8080"]
+    depends_on: [neo4j, postgres, graphrag-agent]
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: infrastructure/Dockerfile.frontend
+    environment:
+      BACKEND_URL: http://backend:8080
+    ports: ["3000:3000"]
+    depends_on: [backend]
+
+volumes:
+  neo4j-data:
+  pg-data:

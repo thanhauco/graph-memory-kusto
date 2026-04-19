@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: graphrag, namespace: icm-memory }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: graphrag } }
+  template:
+    metadata: { labels: { app: graphrag } }
+    spec:
+      containers:
+        - name: graphrag
+          image: icm/graphrag-agent:latest
+          env:
+            - { name: NEO4J_URI,  value: bolt://neo4j:7687 }
+            - { name: NEO4J_USER, value: neo4j }
+            - { name: NEO4J_PASS, value: neo4jpass }
+            - { name: EPISODIC_DB_DSN, value: "postgresql://memuser:mempass@postgres:5432/memdb" }
+            - { name: AZURE_OPENAI_KEY,      valueFrom: { secretKeyRef: { name: aoai, key: key } } }
+            - { name: AZURE_OPENAI_ENDPOINT, valueFrom: { secretKeyRef: { name: aoai, key: endpoint } } }
+          ports: [ { containerPort: 8000 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: graphrag, namespace: icm-memory }
+spec:
+  selector: { app: graphrag }
+  ports: [ { port: 8000, targetPort: 8000 } ]
