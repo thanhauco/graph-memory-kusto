@@ -41,6 +41,163 @@ const SERVICES = {
 };
 const ALL_SERVICES = Object.values(SERVICES).flat();
 
+const DEPENDENCIES = [
+  ["ApiGateway","ServiceA"],["ApiGateway","ServiceC"],["AuthService","ServiceA"],
+  ["BillingAPI","PaymentProc"],["NotifyAPI","MsgBroker"],
+  ["ServiceA","ServiceB"],["ServiceA","DbService"],["ServiceA","CacheLayer"],
+  ["ServiceB","DbService"],["ServiceC","DbService"],["ServiceC","SearchSvc"],
+  ["PaymentProc","DbService"],["SearchSvc","IndexStore"],["MsgBroker","QueueStore"],
+  ["ServiceB","VectorDB"],["ServiceC","GraphDB"],["ServiceA","BlobStore"],
+  ["ServiceB","CacheLayer"],["CacheLayer","ServiceB"],
+];
+
+const TEAM_OWNERS = {
+  ServiceA:"Platform-Core",
+  ServiceB:"Platform-Core",
+  ServiceC:"Platform-Core",
+  ApiGateway:"Platform-Core",
+  AuthService:"Auth-Sec",
+  BillingAPI:"Billing-Eng",
+  PaymentProc:"Billing-Eng",
+  SearchSvc:"Search-Team",
+  NotifyAPI:"Search-Team",
+  MsgBroker:"Messaging-Plat",
+  DbService:"Data-Infra",
+  CacheLayer:"Data-Infra",
+  BlobStore:"Data-Infra",
+  IndexStore:"Data-Infra",
+  QueueStore:"Data-Infra",
+  VectorDB:"Data-Infra",
+  GraphDB:"Data-Infra",
+};
+
+const INCIDENT_FACTS = {
+  "INC-456": { service:"ServiceA", rootCause:"HighCPU", introducedBy:null, episode:"ep-001", confidence:0.94 },
+  "INC-789": { service:"ServiceC", rootCause:"ConnPoolExhaustion", introducedBy:null, episode:"ep-002", confidence:0.87 },
+  "INC-234": { service:"DbService", rootCause:"OvernightBatch", introducedBy:null, episode:"ep-003", confidence:0.91 },
+  "INC-901": { service:"AuthService", rootCause:"MemLeak", introducedBy:"v2.3.1", episode:"ep-004", confidence:0.78 },
+};
+
+function extractIncidentId(text){
+  const m = String(text||"").toUpperCase().match(/INC-\d{3,6}/);
+  return m ? m[0] : null;
+}
+
+function extractServiceName(text){
+  const lower = String(text||"").toLowerCase();
+  return ALL_SERVICES.find(s => lower.includes(s.toLowerCase())) || null;
+}
+
+function buildBlastRadius(service, maxHops=3){
+  const adj = new Map();
+  DEPENDENCIES.forEach(([a,b])=>{
+    if(!adj.has(a)) adj.set(a, []);
+    adj.get(a).push(b);
+  });
+  const seen = new Set([service]);
+  const out = [];
+  let frontier = [service];
+  for(let hop=1; hop<=maxHops; hop++){
+    const next = [];
+    frontier.forEach(src=>{
+      (adj.get(src)||[]).forEach(dst=>{
+        if(!seen.has(dst)){
+          seen.add(dst);
+          next.push(dst);
+          out.push({name:dst,hop});
+        }
+      });
+    });
+    if(next.length===0) break;
+    frontier = next;
+  }
+  return out;
+}
+
+function findDependents(target){
+  return DEPENDENCIES.filter(([,dst])=>dst===target).map(([src])=>src);
+}
+
+function answerNlQuery(text, context){
+  const raw = String(text||"").trim();
+  const lower = raw.toLowerCase();
+  const incident = extractIncidentId(raw) || context.lastIncident;
+  const service = extractServiceName(raw) || context.lastService || (incident && INCIDENT_FACTS[incident]?.service) || null;
+
+  if((lower.includes("root cause") || lower.includes("why") || lower.includes("fail")) && incident && INCIDENT_FACTS[incident]){
+    const f = INCIDENT_FACTS[incident];
+    return {
+      text: `${incident} affected ${f.service}. RCA path: ${incident} ->[AFFECTS]-> ${f.service} ->[DEPENDS_ON]-> ${f.rootCause === "HighCPU" ? "ServiceB" : "DbService"} ->[CAUSED_BY]-> ${f.rootCause}. Evidence: ${f.episode} (confidence ${f.confidence.toFixed(2)}).`,
+      ctx: { lastIncident: incident, lastService: f.service }
+    };
+  }
+
+  if(lower.includes("blast radius") && service){
+    const hops = (raw.match(/(\d+)\s*hops?/) || [])[1];
+    const maxHops = hops ? Math.max(1, Math.min(6, parseInt(hops,10))) : 3;
+    const radius = buildBlastRadius(service, maxHops);
+    if(radius.length===0){
+      return { text:`No downstream dependencies found for ${service} up to ${maxHops} hops.`, ctx:{ lastService: service, lastIncident: incident } };
+    }
+    const grouped = [];
+    for(let h=1; h<=maxHops; h++){
+      const names = radius.filter(r=>r.hop===h).map(r=>r.name);
+      if(names.length) grouped.push(`${h}-hop: ${names.join(", ")}`);
+    }
+    return {
+      text: `Blast radius for ${service} (${maxHops} hops): ${grouped.join(" | ")}. Recommend prioritizing circuit breakers on the 1-hop edges first.`,
+      ctx: { lastService: service, lastIncident: incident }
+    };
+  }
+
+  if((lower.includes("depend on") || lower.includes("depends on") || lower.includes("upstream")) && service){
+    const dependents = findDependents(service);
+    return {
+      text: dependents.length
+        ? `Services that depend on ${service}: ${dependents.join(", ")}.`
+        : `No services currently depend on ${service} in this demo graph.`,
+      ctx: { lastService: service, lastIncident: incident }
+    };
+  }
+
+  if((lower.includes("which team") || lower.includes("owner") || lower.includes("owns")) && service){
+    const owner = TEAM_OWNERS[service];
+    return {
+      text: owner
+        ? `${owner} owns ${service}. Suggested escalation channel: #${owner.toLowerCase().replace(/[^a-z0-9]+/g,"-")}.`
+        : `Owner team for ${service} is not mapped in this demo dataset.`,
+      ctx: { lastService: service, lastIncident: incident }
+    };
+  }
+
+  if(lower.includes("regression") || lower.includes("introduced")){
+    return {
+      text: `Regression hit in last window: INC-901 ->[INTRODUCED_BY]-> v2.3.1 ->[CONTAINS]-> MemLeak (AuthService). Action: rollback to v2.3.0 (ep-004).`,
+      ctx: { lastIncident:"INC-901", lastService:"AuthService" }
+    };
+  }
+
+  if(lower.includes("cycle")){
+    return {
+      text: `Cycle detected on :DEPENDS_ON (depth 2): ServiceB -> CacheLayer -> ServiceB. This can amplify repeated incidents and retries.`,
+      ctx: { lastService:"ServiceB", lastIncident: incident }
+    };
+  }
+
+  if(incident && INCIDENT_FACTS[incident]){
+    const f = INCIDENT_FACTS[incident];
+    return {
+      text: `${incident} maps to service ${f.service} with likely cause ${f.rootCause}. Ask for "blast radius", "owner", or "root cause" for deeper traversal.`,
+      ctx: { lastIncident: incident, lastService: f.service }
+    };
+  }
+
+  return {
+    text: `I can answer incident RCA, blast radius, owner team, cycle detection, and regression attribution. Try: "why did INC-456 fail?" or "blast radius of ServiceA up to 3 hops".`,
+    ctx: { lastIncident: incident, lastService: service }
+  };
+}
+
 const EPISODES = [
   { id:"ep-001", incident:"INC-456", query:"Why did service A fail?",
     hop_path:"INC-456 →[AFFECTS]→ ServiceA →[DEPENDS_ON]→ ServiceB →[CAUSED_BY]→ HighCPU",
@@ -572,14 +729,7 @@ function ServiceMapPanel(){
     });
     return coords;
   },[]);
-  const deps = [
-    ["ApiGateway","ServiceA"],["ApiGateway","ServiceC"],["AuthService","ServiceA"],
-    ["BillingAPI","PaymentProc"],["NotifyAPI","MsgBroker"],
-    ["ServiceA","ServiceB"],["ServiceA","DbService"],["ServiceA","CacheLayer"],
-    ["ServiceB","DbService"],["ServiceC","DbService"],["ServiceC","SearchSvc"],
-    ["PaymentProc","DbService"],["SearchSvc","IndexStore"],["MsgBroker","QueueStore"],
-    ["ServiceB","VectorDB"],["ServiceC","GraphDB"],["ServiceA","BlobStore"],
-  ];
+  const deps = DEPENDENCIES;
   const [sel,setSel] = useState("ServiceA");
   const tierColor = { API:"#06b6d4", Platform:"#7c3aed", Data:"#10b981" };
   const deg = ALL_SERVICES.reduce((acc,s)=>{acc[s]=0;return acc;},{});
@@ -751,29 +901,21 @@ function AgentChatPanel(){
     { role:"asst", text:"Hi — ask me about any incident, service, or root cause. I'll traverse the graph and cite episode IDs." },
   ]);
   const [input,setInput] = useState("");
+  const contextRef = useRef({ lastIncident:null, lastService:null });
   const presets = [
     "Why did ServiceA fail in INC-456?",
     "What's the blast radius of DbService?",
     "Any regressions introduced in the last 7 days?",
     "Cycle detection on Platform tier",
   ];
-  const canned = {
-    "Why did ServiceA fail in INC-456?":
-      "Per episode ep-001 (confidence 0.94): INC-456 →[AFFECTS]→ ServiceA →[DEPENDS_ON]→ ServiceB →[CAUSED_BY]→ HighCPU. ServiceB hit CPU saturation; mitigate with restart + autoscale @ 80% + circuit breaker on ServiceA→ServiceB.",
-    "What's the blast radius of DbService?":
-      "1-hop: ServiceB, ServiceC, BillingAPI, PaymentProc. 2-hop: ApiGateway, AuthService (via ServiceA). Recommend: connection pool ≥50 and circuit breakers on all downstream edges (see ep-003).",
-    "Any regressions introduced in the last 7 days?":
-      "1 hit — INC-901 →[INTRODUCED_BY]→ v2.3.1 →[CONTAINS]→ MemLeak (AuthService). Action taken: rollback to v2.3.0 (ep-004, conf 0.78).",
-    "Cycle detection on Platform tier":
-      "No cycles detected in :DEPENDS_ON at depths 2..8. Graph is a DAG on Platform. (1.9ms, Neo4j GDS).",
-  };
   const send = text => {
     if(!text.trim()) return;
     setMsgs(m=>[...m,{role:"user",text}]);
     setInput("");
     setTimeout(()=>{
-      const r = canned[text] || "Traversing graph… (demo: preset responses are wired; hook a real Claude call at `/api/chat`).";
-      setMsgs(m=>[...m,{role:"asst",text:r}]);
+      const out = answerNlQuery(text, contextRef.current);
+      contextRef.current = { ...contextRef.current, ...out.ctx };
+      setMsgs(m=>[...m,{role:"asst",text:out.text}]);
     },500);
   };
   return (
