@@ -933,10 +933,13 @@ function AuditPanel(){
 function renderMarkdown(src){
   if(!src) return "";
   const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  const inline = s => esc(s)
+  // Linkify INC-xxxx references into clickable chips that focus the Graph Viewer.
+  const linkify = s => s.replace(/\b(INC-\d+)\b/g,
+    '<a href="#" class="gv-focus px-1 rounded bg-rose-500/15 border border-rose-500/40 text-rose-200 hover:bg-rose-500/30 no-underline" data-gv-id="$1" onclick="return window.__gvFocus &amp;&amp; window.__gvFocus(\'$1\')">$1</a>');
+  const inline = s => linkify(esc(s)
     .replace(/`([^`]+)`/g,'<code class="px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-emerald-300 text-[12px]">$1</code>')
     .replace(/\*\*([^*]+)\*\*/g,'<strong class="text-white">$1</strong>')
-    .replace(/\*([^*]+)\*/g,'<em class="text-slate-300">$1</em>');
+    .replace(/\*([^*]+)\*/g,'<em class="text-slate-300">$1</em>'));
   const lines = src.split(/\r?\n/);
   const html = [];
   let inList = false;
@@ -977,7 +980,23 @@ function GraphVizPanel(){
   const [search,setSearch] = useState("");
   const [hoverId,setHoverId] = useState(null);
   const [relayoutNonce,setRelayoutNonce] = useState(0);
+  const [focusId,setFocusId] = useState(null);
   const simRef = useRef({nodes:[], links:[], raf:0, dragging:null, pan:{x:0,y:0}, zoom:1, alpha:1});
+
+  // Listen for cross-panel focus requests (clicks on INC-xxxx chips in chat).
+  useEffect(()=>{
+    const h = e => {
+      const id = e.detail && e.detail.id;
+      if(!id) return;
+      // Make sure the layer for this node type is visible. Most focus requests
+      // come from chat and target incidents, so force Incident on.
+      if(id.startsWith("INC-")) setLabels(l => l.Incident ? l : ({...l, Incident:true}));
+      setFocusId(id);
+      setHoverId(id);
+    };
+    window.addEventListener("gv:focus", h);
+    return ()=>window.removeEventListener("gv:focus", h);
+  },[]);
 
   // fetch snapshot
   useEffect(()=>{
@@ -1000,12 +1019,13 @@ function GraphVizPanel(){
     let incidentsKept = 0;
     const nodeMap = new Map();
     for(const n of snap.nodes){
-      if(!keep.has(n.label)) continue;
-      if(n.label==="Incident"){
+      const isFocus = focusId && n.id === focusId;
+      if(!isFocus && !keep.has(n.label)) continue;
+      if(!isFocus && n.label==="Incident"){
         if(incidentsKept >= maxIncidents) continue;
         incidentsKept++;
       }
-      if(search && !(n.id.toLowerCase().includes(search.toLowerCase()) ||
+      if(!isFocus && search && !(n.id.toLowerCase().includes(search.toLowerCase()) ||
                      (n.name||"").toLowerCase().includes(search.toLowerCase()))){
         if(n.label!=="Service" && n.label!=="Team") continue; // always keep services+teams as anchors
       }
@@ -1062,7 +1082,16 @@ function GraphVizPanel(){
     simRef.current.nodes = nodes;
     simRef.current.links = links;
     simRef.current.alpha = 0;
-  },[snap, labels, maxIncidents, search, linkDist, charge, relayoutNonce]);
+
+    // If a focus target is set, zoom in and pan so it sits in the middle.
+    if(focusId){
+      const f = nodes.find(n => n.id === focusId);
+      if(f){
+        simRef.current.zoom = 1.6;
+        simRef.current.pan  = { x: -f.x * simRef.current.zoom, y: -f.y * simRef.current.zoom };
+      }
+    }
+  },[snap, labels, maxIncidents, search, linkDist, charge, relayoutNonce, focusId]);
 
   // force simulation loop
   useEffect(()=>{
@@ -1635,6 +1664,19 @@ function App(){
   const [tab,setTab] = useState(PARTS["Core"][0].id);
   const active = PARTS[part].find(t=>t.id===tab) || PARTS[part][0];
   const switchPart = p => { setPart(p); setTab(PARTS[p][0].id); };
+
+  // Global hook: chat answers call this when a user clicks an INC-xxxx chip.
+  // It switches to the Graph Viewer tab and asks the panel to focus that node.
+  useEffect(()=>{
+    window.__gvFocus = (id)=>{
+      setPart("Advanced");
+      setTab("viz");
+      // defer so the panel has mounted before we fire the focus event
+      setTimeout(()=>window.dispatchEvent(new CustomEvent("gv:focus",{detail:{id}})), 60);
+      return false; // cancel the anchor default
+    };
+    return ()=>{ delete window.__gvFocus; };
+  },[]);
 
   return (
     <div className="min-h-screen">
