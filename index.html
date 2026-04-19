@@ -976,6 +976,7 @@ function GraphVizPanel(){
   const [maxIncidents,setMaxIncidents] = useState(60);
   const [search,setSearch] = useState("");
   const [hoverId,setHoverId] = useState(null);
+  const [relayoutNonce,setRelayoutNonce] = useState(0);
   const simRef = useRef({nodes:[], links:[], raf:0, dragging:null, pan:{x:0,y:0}, zoom:1, alpha:1});
 
   // fetch snapshot
@@ -1016,10 +1017,52 @@ function GraphVizPanel(){
         links.push({ source: nodeMap.get(e.source), target: nodeMap.get(e.target), type: e.type });
       }
     }
-    simRef.current.nodes = [...nodeMap.values()];
+    const nodes = [...nodeMap.values()];
+
+    // Pre-compute a static layout: run the force simulation headlessly, then freeze.
+    // Nothing animates on screen; nodes only move when the user drags them.
+    const ITER = 260;
+    for(let step=0; step<ITER; step++){
+      const a0 = 1 - step/ITER; // cooling schedule
+      // repulsion
+      for(let i=0;i<nodes.length;i++){
+        const a = nodes[i];
+        for(let j=i+1;j<nodes.length;j++){
+          const b = nodes[j];
+          let dx = a.x-b.x, dy = a.y-b.y;
+          let d2 = dx*dx+dy*dy + 0.01;
+          if(d2 > 40000) continue;
+          const f = charge / d2;
+          const d = Math.sqrt(d2);
+          const fx = f * dx/d, fy = f * dy/d;
+          a.vx += fx; a.vy += fy;
+          b.vx -= fx; b.vy -= fy;
+        }
+      }
+      // springs
+      for(const l of links){
+        const dx = l.target.x - l.source.x, dy = l.target.y - l.source.y;
+        const d = Math.sqrt(dx*dx+dy*dy) + 0.01;
+        const f = (d - linkDist) * 0.02;
+        const fx = f * dx/d, fy = f * dy/d;
+        l.source.vx += fx; l.source.vy += fy;
+        l.target.vx -= fx; l.target.vy -= fy;
+      }
+      // gravity + integrate + damping
+      for(const n of nodes){
+        n.vx += (0 - n.x) * 0.002;
+        n.vy += (0 - n.y) * 0.002;
+        n.vx *= 0.72; n.vy *= 0.72;
+        n.x += n.vx * a0; n.y += n.vy * a0;
+      }
+    }
+    // Freeze: zero out velocities. tick() will only draw.
+    for(const n of nodes){ n.vx = 0; n.vy = 0; }
+
+    simRef.current.nodes = nodes;
     simRef.current.links = links;
-    simRef.current.alpha = 1; // reheat whenever the graph is rebuilt
-  },[snap, labels, maxIncidents, search]);
+    simRef.current.alpha = 0;
+  },[snap, labels, maxIncidents, search, linkDist, charge, relayoutNonce]);
 
   // force simulation loop
   useEffect(()=>{
@@ -1041,50 +1084,9 @@ function GraphVizPanel(){
       const w = cvs.clientWidth, h = cvs.clientHeight;
       const cx = w/2, cy = h/2;
 
-      // Only compute physics while "hot" (alpha > 0) or while dragging.
-      const physicsOn = s.alpha > 0.005 || s.dragging;
-
-      if(physicsOn){
-        const a0 = s.alpha;
-        // repulsion
-        for(let i=0;i<nodes.length;i++){
-          const a = nodes[i];
-          for(let j=i+1;j<nodes.length;j++){
-            const b = nodes[j];
-            let dx = a.x-b.x, dy = a.y-b.y;
-            let d2 = dx*dx+dy*dy + 0.01;
-            if(d2 > 40000) continue;
-            const f = charge * a0 / d2;
-            const d = Math.sqrt(d2);
-            const fx = f * dx/d, fy = f * dy/d;
-            a.vx += fx; a.vy += fy;
-            b.vx -= fx; b.vy -= fy;
-          }
-        }
-        // springs
-        for(const l of links){
-          const dx = l.target.x - l.source.x, dy = l.target.y - l.source.y;
-          const d = Math.sqrt(dx*dx+dy*dy) + 0.01;
-          const f = (d - linkDist) * 0.02 * a0;
-          const fx = f * dx/d, fy = f * dy/d;
-          l.source.vx += fx; l.source.vy += fy;
-          l.target.vx -= fx; l.target.vy -= fy;
-        }
-        // gravity + integrate with strong damping
-        for(const n of nodes){
-          n.vx += (0 - n.x) * 0.002 * a0;
-          n.vy += (0 - n.y) * 0.002 * a0;
-          n.vx *= 0.72; n.vy *= 0.72;
-          if(s.dragging !== n){
-            n.x += n.vx; n.y += n.vy;
-          } else {
-            n.vx = n.vy = 0;
-          }
-        }
-        // cool the system; while dragging keep it slightly warm
-        if(s.dragging){ s.alpha = Math.max(s.alpha, 0.3); }
-        else { s.alpha *= 0.94; if(s.alpha < 0.005) s.alpha = 0; }
-      }
+      // No physics here — nodes are placed once by the pre-computed layout above.
+      // The only node that ever changes position is the one the user is dragging
+      // (handled directly in onPointerMove).
       // draw
       ctx.clearRect(0,0,w,h);
       ctx.save();
@@ -1138,7 +1140,7 @@ function GraphVizPanel(){
     const mx = (e.clientX - r.left - r.width/2 - pan.x) / zoom;
     const my = (e.clientY - r.top  - r.height/2 - pan.y) / zoom;
     const hit = nodes.find(n => (n.x-mx)**2 + (n.y-my)**2 < 100);
-    if(hit){ simRef.current.dragging = hit; simRef.current.alpha = 0.6; }
+    if(hit){ simRef.current.dragging = hit; }
     else   { simRef.current.panning = {x: e.clientX, y: e.clientY, pan0:{...pan}}; }
   };
   const onPointerMove = e => {
@@ -1271,9 +1273,9 @@ function GraphVizPanel(){
           drag nodes · scroll to zoom · drag background to pan · hover for details
         </div>
         <button
-          onClick={()=>{ simRef.current.alpha = 1; }}
+          onClick={()=>{ setRelayoutNonce(n=>n+1); }}
           className="mt-3 w-full px-3 py-1.5 rounded-md bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold">
-          Reheat layout
+          Relayout
         </button>
       </Card>
     </div>
