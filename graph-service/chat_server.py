@@ -130,6 +130,50 @@ def run_cypher(cypher: str, params: dict | None = None) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# Per-request trace collector.  Handlers append each Cypher they execute so
+# the UI can render a transparent reasoning trace (matched handler, extracted
+# entities, Cypher text, params, row count, elapsed ms).
+# ---------------------------------------------------------------------------
+import threading, time
+_trace_local = threading.local()
+
+def _trace() -> list[dict]:
+    buf = getattr(_trace_local, "buf", None)
+    if buf is None:
+        buf = []
+        _trace_local.buf = buf
+    return buf
+
+def _trace_reset() -> None:
+    _trace_local.buf = []
+
+def traced_cypher(cypher: str, params: dict | None = None, note: str = "") -> list[dict]:
+    """Wrapper around run_cypher that records the query in the active trace."""
+    t0 = time.perf_counter()
+    try:
+        rows = run_cypher(cypher, params)
+        ok = True
+        err = None
+    except Exception as e:
+        rows = []
+        ok = False
+        err = str(e)
+    ms = round((time.perf_counter() - t0) * 1000, 2)
+    _trace().append({
+        "note": note,
+        "cypher": cypher.strip(),
+        "params": params or {},
+        "rows": len(rows),
+        "elapsed_ms": ms,
+        "ok": ok,
+        "error": err,
+    })
+    if not ok:
+        raise RuntimeError(err)
+    return rows
+
+
 def maybe_llm_synthesis(question: str, grounded_answer: str, evidence: list[dict]) -> str | None:
     """Optionally polish answer with existing GraphRAG agent when AOAI env is set."""
     if not (os.getenv("AZURE_OPENAI_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT")):
@@ -171,7 +215,7 @@ MATCH (i:Incident)-[:AFFECTS]->(s:Service)-[:CAUSED_BY]->(r:RootCause {type:$rc}
 RETURN i.id AS id, i.title AS title, i.severity AS severity, s.name AS service
 ORDER BY i.severity, i.id LIMIT 25
 """
-    rows = run_cypher(cypher, {"rc": rc})
+    rows = traced_cypher(cypher, {"rc": rc}, note="by_root_cause:incidents AFFECTS->CAUSED_BY")
     if not rows:
         return (f"No incidents linked to root cause `{rc}` in the current graph.", [])
     sample = ", ".join(f"{r['id']} ({r['service']})" for r in rows[:6])
@@ -200,7 +244,7 @@ WHERE cnt >= $minServices
 RETURN i.id AS id, i.severity AS severity, cnt AS impacted_count, impacted[0..8] AS sample
 ORDER BY cnt DESC LIMIT 12
 """
-    rows = run_cypher(cypher, {"minServices": min_services})
+    rows = traced_cypher(cypher, {"minServices": min_services}, note="impact_count:AFFECTS + DEPENDS_ON*1..3")
     if not rows:
         return (
             f"No incidents impact {min_services} or more services (direct + 3-hop blast radius).",
@@ -231,7 +275,7 @@ MATCH p=(:Service {{name:$svc}})-[:DEPENDS_ON*1..{hops}]->(s:Service)
 RETURN DISTINCT s.name AS service, s.tier AS tier, length(p) AS hops
 ORDER BY hops, service
 """
-    rows = run_cypher(cypher, {"svc": svc})
+    rows = traced_cypher(cypher, {"svc": svc}, note=f"blast_radius:DEPENDS_ON*1..{hops}")
     if not rows:
         return (f"No downstream dependencies for {svc} up to {hops} hops.", [])
     by_hop: dict[int, list[str]] = {}
@@ -256,7 +300,7 @@ RETURN i.id AS id, s.name AS service,
        collect(DISTINCT d.name)[0..5] AS downstream,
        collect(DISTINCT coalesce(r.type, r2.type))[0..5] AS causes
 """
-    rows = run_cypher(cypher, {"id": inc})
+    rows = traced_cypher(cypher, {"id": inc}, note="rca_of_incident:AFFECTS + DEPENDS_ON + CAUSED_BY")
     if not rows:
         return (f"{inc} not found in graph.", [])
     r = rows[0]
@@ -283,7 +327,7 @@ MATCH (s:Service)-[:DEPENDS_ON]->(:Service {name:$svc})
 RETURN s.name AS service, s.tier AS tier
 ORDER BY tier, service
 """
-    rows = run_cypher(cypher, {"svc": svc})
+    rows = traced_cypher(cypher, {"svc": svc}, note="dependents:inverse DEPENDS_ON")
     if not rows:
         return (f"No services depend on {svc}.", [])
     names = ", ".join(r["service"] for r in rows)
@@ -301,7 +345,7 @@ def h_owner(q: str) -> tuple[str, list[dict]] | None:
 MATCH (t:Team)-[:OWNS]->(:Service {name:$svc})
 RETURN t.name AS team, t.slackChannel AS channel, t.oncallRotation AS oncall
 """
-    rows = run_cypher(cypher, {"svc": svc})
+    rows = traced_cypher(cypher, {"svc": svc}, note="owner:Team-OWNS->Service")
     if not rows:
         return (f"{svc} has no owning team in the graph.", [])
     t = rows[0]
@@ -321,7 +365,7 @@ WHERE length(p) > 1
 RETURN [n IN nodes(p) | n.name] AS cycle, length(p) AS hops
 ORDER BY hops LIMIT 5
 """
-    rows = run_cypher(cypher)
+    rows = traced_cypher(cypher, note="cycles:DEPENDS_ON*2..8 self-loop")
     if not rows:
         return ("No dependency cycles detected in :DEPENDS_ON (depth 2..8).", [])
     sample = "; ".join(" -> ".join(r["cycle"]) for r in rows[:3])
@@ -339,7 +383,7 @@ RETURN i.id AS incident, d.version AS version, d.deployedBy AS deployed_by,
        s.name AS service, i.severity AS severity
 ORDER BY d.deployedAt DESC LIMIT 15
 """
-    rows = run_cypher(cypher)
+    rows = traced_cypher(cypher, note="regressions:INTRODUCED_BY + AFFECTS")
     if not rows:
         return ("No regressions linked to deployments in the current window.", [])
     sample = "; ".join(
@@ -361,7 +405,7 @@ MATCH (i:Incident)-[:AFFECTS]->(:Service {name:$svc})
 RETURN i.id AS id, i.title AS title, i.severity AS severity, i.status AS status
 ORDER BY i.createdDate DESC LIMIT 20
 """
-    rows = run_cypher(cypher, {"svc": svc})
+    rows = traced_cypher(cypher, {"svc": svc}, note="incidents_on_service:AFFECTS")
     if not rows:
         return (f"No incidents found affecting {svc}.", [])
     sample = ", ".join(f"{r['id']} (sev {r['severity']})" for r in rows[:6])
@@ -406,7 +450,7 @@ def h_hybrid_search(q: str) -> tuple[str, list[dict]] | None:
         return None
 
     # Pull candidate corpus from Neo4j (Incidents + RootCauses).
-    corpus = run_cypher(
+    corpus = traced_cypher(
         """
 MATCH (i:Incident)
 OPTIONAL MATCH (i)-[:AFFECTS]->(s:Service)
@@ -415,7 +459,8 @@ RETURN i.id AS id, i.title AS title, i.severity AS severity, i.status AS status,
        s.name AS service,
        collect(DISTINCT r.type)        AS cause_types,
        collect(DISTINCT r.description) AS cause_desc
-"""
+""",
+        note="hybrid:corpus pull Incident+AFFECTS+CAUSED_BY",
     )
 
     scored: list[dict] = []
@@ -440,7 +485,7 @@ RETURN i.id AS id, i.title AS title, i.severity AS severity, i.status AS status,
     lead_service = next((r["service"] for r in top if r.get("service")), None)
     lead_incident = top[0]["id"]
     if lead_service:
-        expansion = run_cypher(
+        expansion = traced_cypher(
             """
 MATCH (s:Service {name:$svc})
 OPTIONAL MATCH (s)-[:DEPENDS_ON*1..2]->(d:Service)
@@ -452,6 +497,7 @@ RETURN s.name   AS service,
        dep.version AS deployment
 """,
             {"svc": lead_service, "iid": lead_incident},
+            note="hybrid:graph expansion DEPENDS_ON*1..2 + OWNS + INTRODUCED_BY",
         )
 
     # Synthesize grounded answer.
@@ -502,6 +548,13 @@ HANDLERS = [
 
 
 def infer(question: str) -> dict:
+    _trace_reset()
+    t0 = time.perf_counter()
+    entities = {
+        "incident_id": extract_incident_id(question),
+        "service":     extract_service(question),
+        "root_cause":  extract_root_cause(question),
+    }
     for h in HANDLERS:
         try:
             out = h(question)
@@ -511,11 +564,26 @@ def infer(question: str) -> dict:
                 "answer": f"Query failed while running `{h.__name__}`: {e}",
                 "evidence": [],
                 "handler": h.__name__,
+                "trace": {
+                    "entities": entities,
+                    "cypher_steps": _trace(),
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
+                },
             }
         if out is not None:
             ans, ev = out
             final_answer = maybe_llm_synthesis(question, ans, ev) or ans
-            return {"ok": True, "answer": final_answer, "evidence": ev[:10], "handler": h.__name__}
+            return {
+                "ok": True,
+                "answer": final_answer,
+                "evidence": ev[:10],
+                "handler": h.__name__,
+                "trace": {
+                    "entities": entities,
+                    "cypher_steps": _trace(),
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
+                },
+            }
     return {
         "ok": True,
         "answer": (
@@ -526,6 +594,11 @@ def infer(question: str) -> dict:
         ),
         "evidence": [],
         "handler": "fallback",
+        "trace": {
+            "entities": entities,
+            "cypher_steps": _trace(),
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
+        },
     }
 
 

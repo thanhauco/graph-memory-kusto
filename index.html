@@ -957,6 +957,7 @@ function AgentChatPanel(){
     setMsgs(m=>[...m,{role:"user",text},{role:"asst",text:"…thinking (querying Neo4j)"}]);
     setInput("");
     let reply = null;
+    let trace = null;
     try {
       const r = await fetch("http://127.0.0.1:8765/chat", {
         method:"POST",
@@ -965,10 +966,8 @@ function AgentChatPanel(){
       });
       if(r.ok){
         const j = await r.json();
-        const ev = Array.isArray(j.evidence) && j.evidence.length
-          ? "\n\nEvidence ("+j.handler+"): "+JSON.stringify(j.evidence.slice(0,4))
-          : "\n\n(handler: "+j.handler+")";
-        reply = (j.answer || "(empty)") + ev;
+        reply = (j.answer || "(empty)");
+        trace = { handler: j.handler, evidence: j.evidence || [], trace: j.trace || {} };
       }
     } catch(_e){ /* server offline -> fallback */ }
     if(reply === null){
@@ -978,7 +977,7 @@ function AgentChatPanel(){
     }
     setMsgs(m=>{
       const base = m.slice(0,-1); // drop the …thinking placeholder
-      return [...base,{role:"asst",text:reply}];
+      return [...base,{role:"asst",text:reply,trace}];
     });
   };
   return (
@@ -994,7 +993,36 @@ function AgentChatPanel(){
               <div className={`max-w-[80%] px-3 py-2 rounded-lg text-sm
                 ${m.role==="user"?"bg-violet-600 text-white":
                   m.role==="sys"?"bg-slate-800/50 text-slate-400 text-xs italic":"bg-slate-800 text-slate-100"}`}>
-                {m.text}
+                <div className="whitespace-pre-wrap">{m.text}</div>
+                {m.trace && (
+                  <details className="mt-2 border-t border-slate-700 pt-2">
+                    <summary className="text-[11px] text-emerald-400 cursor-pointer select-none">
+                      show reasoning trace — handler: {m.trace.handler} · {(m.trace.trace?.cypher_steps?.length||0)} Cypher step(s) · {m.trace.trace?.elapsed_ms} ms
+                    </summary>
+                    <div className="mt-2 space-y-2 text-[11px]">
+                      {m.trace.trace?.entities && (
+                        <div className="text-slate-400">
+                          entities: {JSON.stringify(m.trace.trace.entities)}
+                        </div>
+                      )}
+                      {(m.trace.trace?.cypher_steps||[]).map((s,k)=>(
+                        <div key={k} className="bg-slate-950 border border-slate-800 rounded p-2">
+                          <div className="text-amber-300 mb-1">[{k+1}] {s.note} — {s.rows} row(s) · {s.elapsed_ms} ms</div>
+                          <pre className="text-cyan-300 whitespace-pre-wrap font-mono text-[11px] leading-tight">{s.cypher}</pre>
+                          {s.params && Object.keys(s.params).length>0 && (
+                            <div className="text-slate-400 mt-1">params: {JSON.stringify(s.params)}</div>
+                          )}
+                        </div>
+                      ))}
+                      {m.trace.evidence?.length>0 && (
+                        <div className="bg-slate-950 border border-slate-800 rounded p-2">
+                          <div className="text-violet-300 mb-1">evidence ({m.trace.evidence.length})</div>
+                          <pre className="text-slate-300 whitespace-pre-wrap font-mono text-[11px] leading-tight">{JSON.stringify(m.trace.evidence,null,2)}</pre>
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                )}
               </div>
             </div>
           ))}
