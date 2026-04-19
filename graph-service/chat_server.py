@@ -702,6 +702,52 @@ def infer(question: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Graph snapshot for UI visualizer
+# ---------------------------------------------------------------------------
+def graph_snapshot() -> dict:
+    """Return all nodes and edges (with label/type) as a compact JSON payload."""
+    nodes: list[dict] = []
+    seen: set[str] = set()
+    for label in ("Service", "Team", "RootCause", "Deployment", "Incident"):
+        cy = f"MATCH (n:{label}) RETURN n LIMIT 2000"
+        try:
+            rows = run_cypher(cy)
+        except Exception:
+            continue
+        for r in rows:
+            n = r["n"]
+            props = dict(n) if not isinstance(n, dict) else n
+            nid = props.get("id") or props.get("name") or props.get("type") or props.get("version")
+            if not nid or nid in seen:
+                continue
+            seen.add(nid)
+            nodes.append({
+                "id": str(nid),
+                "label": label,
+                "name": props.get("name") or props.get("title") or str(nid),
+                "severity": props.get("severity"),
+                "tier": props.get("tier"),
+            })
+    edges: list[dict] = []
+    edge_queries = [
+        ("AFFECTS",       "MATCH (i:Incident)-[:AFFECTS]->(s:Service) RETURN i.id AS a, s.name AS b"),
+        ("DEPENDS_ON",    "MATCH (a:Service)-[:DEPENDS_ON]->(b:Service) RETURN a.name AS a, b.name AS b"),
+        ("CAUSED_BY",     "MATCH (s:Service)-[:CAUSED_BY]->(r:RootCause) RETURN s.name AS a, r.type AS b"),
+        ("OWNS",          "MATCH (t:Team)-[:OWNS]->(s:Service) RETURN t.name AS a, s.name AS b"),
+        ("INTRODUCED_BY", "MATCH (i:Incident)-[:INTRODUCED_BY]->(d:Deployment) RETURN i.id AS a, d.version AS b"),
+    ]
+    for rel, cy in edge_queries:
+        try:
+            for r in run_cypher(cy):
+                if r.get("a") and r.get("b"):
+                    edges.append({"source": str(r["a"]), "target": str(r["b"]), "type": rel})
+        except Exception:
+            continue
+    return {"nodes": nodes, "edges": edges,
+            "counts": {"nodes": len(nodes), "edges": len(edges)}}
+
+
+# ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 class ChatHandler(BaseHTTPRequestHandler):
@@ -722,6 +768,22 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "ok"}).encode())
+            return
+        if self.path == "/graph":
+            try:
+                snap = graph_snapshot()
+                payload = json.dumps(snap).encode()
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as e:
+                self.send_response(500)
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
         self.send_response(404)
         self._cors()
