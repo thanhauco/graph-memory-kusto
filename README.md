@@ -27,8 +27,83 @@ enterprise telemetry. See [`docs/CONTEXT.md`](docs/CONTEXT.md) for the full spec
 ## Quickstart — demo UI
 
 ```powershell
-python -m http.server 8080
+python -m http.server 8080 --bind 127.0.0.1
 # open http://localhost:8080/
+```
+
+---
+
+## Quickstart — dedicated Neo4j for this project (separate container)
+
+Use this path when port 7687 is already occupied by another demo.
+
+### 1) Run a dedicated Neo4j container
+
+```powershell
+# clean up old container name if it exists
+docker rm -f gmk-neo4j 2>$null
+
+# start a new isolated Neo4j for this repo
+docker run -d --name gmk-neo4j `
+    -p 7475:7474 -p 7688:7687 `
+    -e NEO4J_AUTH=neo4j/neo4jpass `
+    neo4j:5.19
+```
+
+### 2) Credentials and connection info
+
+| Field | Value |
+|---|---|
+| Browser URL | http://localhost:7475 |
+| Bolt URI | bolt://localhost:7688 |
+| Username | neo4j |
+| Password | neo4jpass |
+
+### 3) Seed 400-incident mock graph data
+
+```powershell
+$env:NEO4J_URI  = 'bolt://localhost:7688'
+$env:NEO4J_USER = 'neo4j'
+$env:NEO4J_PASS = 'neo4jpass'
+
+python kusto-ingestion/seed_neo4j.py
+```
+
+Expected summary includes:
+- incidents 400
+- services 17
+- root_causes 8
+- teams 6
+- deployments 60
+- alerts 595
+
+### 4) Run all built-in multi-hop query demos
+
+```powershell
+$env:NEO4J_URI  = 'bolt://localhost:7688'
+$env:NEO4J_USER = 'neo4j'
+$env:NEO4J_PASS = 'neo4jpass'
+
+python graph-service/demo_queries.py run-all
+```
+
+### 5) Run showcase queries used in presentation
+
+```powershell
+$env:NEO4J_URI  = 'bolt://localhost:7688'
+$env:NEO4J_USER = 'neo4j'
+$env:NEO4J_PASS = 'neo4jpass'
+
+python graph-service/demo_queries.py run Q04
+python graph-service/demo_queries.py run Q06
+python graph-service/demo_queries.py run Q08
+python graph-service/demo_queries.py run Q11
+```
+
+### 6) Stop and remove this dedicated Neo4j
+
+```powershell
+docker rm -f gmk-neo4j
 ```
 
 ## Quickstart — full stack (Docker)
@@ -45,6 +120,10 @@ docker compose -f infrastructure/docker-compose.yml up --build
 | http://localhost:5000  | .NET API |
 | http://localhost:8000  | Python GraphRAG agent |
 | http://localhost:7474  | Neo4j browser |
+
+Note: this compose stack maps Neo4j to ports 7474/7687. If those ports are
+already used by another local graph demo, use the dedicated container flow
+above (7475/7688).
 
 ---
 
