@@ -1,0 +1,5 @@
+// Telemetry window join — CPU per service, last 1h
+PerfCounters
+| where TimeGenerated > ago(1h)
+| where CounterName == "% Processor Time"
+| summarize avg_cpu = avg(CounterValue) by bin(TimeGenerated, 1m), ServiceName

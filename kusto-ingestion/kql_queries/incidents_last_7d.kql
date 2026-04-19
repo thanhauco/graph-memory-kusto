@@ -1,0 +1,6 @@
+// §6 KQL source query — last 7 days of incidents
+Incidents
+| where CreatedDate > ago(7d)
+| project IncidentId, Title, AffectedService, Severity, CreatedDate
+| order by CreatedDate desc
+| take 400

@@ -1,0 +1,4 @@
+// Alerts fired in the last 24h — used for :TRIGGERS edges
+Alerts
+| where FiredAt > ago(24h)
+| project AlertId, Rule, Threshold, FiredAt, Source, IncidentId
