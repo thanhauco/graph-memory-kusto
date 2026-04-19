@@ -44,9 +44,71 @@ python graph-service/chat_server.py
 # listens on http://127.0.0.1:8765
 ```
 
-The chat panel posts questions to /chat and receives graph-grounded answers
+The chat panel posts questions to `/chat` and receives graph-grounded answers
 from live Cypher queries. If Azure OpenAI env vars are present, answers are
 optionally LLM-polished while staying grounded in the evidence rows.
+
+#### How the chat server reasons
+
+The server runs a cascade of intent handlers against live Neo4j. The first one
+that matches returns an answer; if none matches, the hybrid search handler
+fuses lexical ranking with graph expansion so free-form questions still work.
+
+| Handler                 | Triggers                                      | Graph pattern |
+|-------------------------|-----------------------------------------------|---------------|
+| `h_by_root_cause`       | "related to DNS", "caused by CPU", aliases    | `(i)-[:AFFECTS]->(s)-[:CAUSED_BY]->(r:RootCause)` |
+| `h_impact_count`        | "impact more than N services"                 | `(i)-[:AFFECTS]->(s)-[:DEPENDS_ON*1..3]->(d)`     |
+| `h_blast_radius`        | "blast radius of X up to N hops"              | `(:Service {name:X})-[:DEPENDS_ON*1..N]->(s)`     |
+| `h_root_cause_of_incident` | "why did INC-#### fail?"                   | `(i {id})-[:AFFECTS]->(s)-[:DEPENDS_ON]->(d)-[:CAUSED_BY]->(r)` |
+| `h_regressions`         | "regressions", "introduced by deployment"     | `(i)-[:INTRODUCED_BY]->(d:Deployment)`            |
+| `h_cycles`              | "detect cycles", "loops"                      | `(s)-[:DEPENDS_ON*2..8]->(s)` cycle               |
+| `h_owner`               | "who owns", "which team"                      | `(t:Team)-[:OWNS]->(s)`                           |
+| `h_dependents`          | "depends on", "consumers of"                  | `(s)-[:DEPENDS_ON]->(:Service {name:X})`          |
+| `h_incidents_on_service` | "incidents on database", alias resolved      | `(i)-[:AFFECTS]->(:Service {name:X})`             |
+| `h_hybrid_search`       | catch-all for free-form NL                    | TF-IDF style ranking + graph expansion (see below)|
+
+NL aliases resolve natural phrasing to canonical services (e.g. "Azure Blob
+storage" -> `BlobStore`, "the database" -> `DbService`, "the cache" ->
+`CacheLayer`, "payment" -> `PaymentProc`, "notifications" -> `NotifyAPI`,
+"kafka" -> `MsgBroker`, etc.).
+
+#### Hybrid search (vector + graph)
+
+The `h_hybrid_search` handler combines a vector-style lexical ranker with a
+graph neighborhood expansion step, which is what turns "disk full problems on
+the database" or "memory leak in auth" into grounded multi-hop answers:
+
+1. **Corpus pull (graph read).** Pulls every `Incident` with its `AFFECTS`
+    service and all linked `:CAUSED_BY` `RootCause` types/descriptions so each
+    candidate doc already carries graph context.
+2. **Vector-style ranking (lexical).** Tokenises the user question (stop-word
+    filtered), scores each candidate with an overlap-over-length function that
+    approximates cosine similarity across title + service + root-cause text.
+3. **Graph expansion (multi-hop read).** Takes the top-ranked incident's
+    service and expands `DEPENDS_ON*1..2` downstream services, the owning
+    `Team`, and any linked `Deployment` (INTRODUCED_BY), so the answer cites
+    the full blast radius and ownership path, not just the matched rows.
+4. **Fusion + synthesis.** Returns the top-5 ranked incidents plus a
+    grounded graph-expansion paragraph as a single answer with evidence rows.
+    If Azure OpenAI env vars are set, the answer is LLM-polished while
+    preserving the evidence.
+
+Try it against the running server:
+
+```powershell
+$q = @(
+    'disk full problems on the database',
+    'memory leak in auth',
+    'something about cross-az throttling',
+    'what happened with overnight batch',
+    'which incidents mention pool'
+)
+foreach ($x in $q) {
+    $b = @{question = $x} | ConvertTo-Json
+    (Invoke-RestMethod -Uri http://127.0.0.1:8765/chat -Method POST `
+        -ContentType 'application/json' -Body $b).answer
+}
+```
 
 ---
 

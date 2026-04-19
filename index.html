@@ -942,6 +942,15 @@ function AgentChatPanel(){
     "Which team owns DbService?",
     "Detect cycles",
     "Regressions introduced by deployments",
+    "Why did INC-1008 fail?",
+    "Which services depend on DbService?",
+    "Incidents on Azure Blob storage",
+    "Memory leak in auth",
+    "Cross-az throttling impacting payments",
+    "Which teams own services in the blast radius of CacheLayer up to 2 hops?",
+    "Incidents whose root cause cascades through ServiceB to CacheLayer",
+    "Regressions from deployments that affect BillingAPI downstream",
+    "Root cause of the highest-severity incident on SearchSvc",
   ];
   const send = async text => {
     if(!text.trim()) return;

@@ -39,6 +39,26 @@ SERVICE_NAMES = [
     "VectorDB", "GraphDB",
 ]
 
+# Natural-language aliases -> canonical service name
+SERVICE_ALIASES = {
+    "blob store": "BlobStore", "blob storage": "BlobStore", "blob": "BlobStore",
+    "azure blob": "BlobStore", "object storage": "BlobStore",
+    "cache": "CacheLayer", "cache layer": "CacheLayer", "redis": "CacheLayer",
+    "database": "DbService", "db": "DbService", "sql": "DbService",
+    "queue": "QueueStore", "queue store": "QueueStore", "service bus": "QueueStore",
+    "search": "SearchSvc", "search svc": "SearchSvc", "search service": "SearchSvc",
+    "vector db": "VectorDB", "vectordb": "VectorDB", "vector store": "VectorDB",
+    "graph db": "GraphDB", "graphdb": "GraphDB", "graph database": "GraphDB",
+    "api gateway": "ApiGateway", "gateway": "ApiGateway",
+    "auth": "AuthService", "authentication": "AuthService", "auth service": "AuthService",
+    "billing": "BillingAPI", "billing api": "BillingAPI",
+    "notify": "NotifyAPI", "notification": "NotifyAPI", "notifications": "NotifyAPI",
+    "payment": "PaymentProc", "payments": "PaymentProc", "payment processor": "PaymentProc",
+    "message broker": "MsgBroker", "msg broker": "MsgBroker", "broker": "MsgBroker",
+    "kafka": "MsgBroker",
+    "index": "IndexStore", "index store": "IndexStore",
+}
+
 ROOT_CAUSE_KEYWORDS = {
     "DNSFailure":         ["dns", "dnsfailure", "resolver"],
     "HighCPU":            ["cpu", "highcpu", "cpu saturation"],
@@ -61,6 +81,10 @@ def extract_service(text: str) -> str | None:
     for name in SERVICE_NAMES:
         if name.lower() in low:
             return name
+    # try longer aliases first so "blob storage" beats "blob"
+    for alias in sorted(SERVICE_ALIASES, key=len, reverse=True):
+        if alias in low:
+            return SERVICE_ALIASES[alias]
     return None
 
 
@@ -344,6 +368,125 @@ ORDER BY i.createdDate DESC LIMIT 20
     return (f"{len(rows)} incident(s) affecting {svc}: {sample}.", rows)
 
 
+# ---------------------------------------------------------------------------
+# Hybrid search: lexical/"vector-style" scoring over Incident+RootCause text,
+# fused with graph expansion (affected service, downstream deps, owning team,
+# linked deployment).  This is the catch-all handler that runs when no
+# specific intent matched, so any free-form question still gets a grounded
+# multi-hop answer.
+# ---------------------------------------------------------------------------
+_STOPWORDS = {
+    "a","an","the","is","are","was","were","be","been","to","of","in","on","at",
+    "for","and","or","with","any","some","incidents","incident","outage","outages",
+    "causing","caused","cause","related","about","show","me","list","find","what",
+    "which","who","why","how","that","this","these","those","did","do","does",
+    "have","has","had","please","i","you","my","our","can","tell","give","need",
+    "there","it","they","them","azure","service","services","issue","issues",
+}
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if t and t not in _STOPWORDS and len(t) > 2]
+
+
+def _score(query_terms: set[str], doc_terms: list[str]) -> float:
+    if not query_terms or not doc_terms:
+        return 0.0
+    bag = {}
+    for t in doc_terms:
+        bag[t] = bag.get(t, 0) + 1
+    hit = sum(bag[t] for t in query_terms if t in bag)
+    # length-normalised like cosine-ish
+    return hit / (1.0 + 0.25 * len(doc_terms))
+
+
+def h_hybrid_search(q: str) -> tuple[str, list[dict]] | None:
+    """Lexical (vector-style) ranking fused with graph neighborhood expansion."""
+    qterms = set(_tokens(q))
+    if not qterms:
+        return None
+
+    # Pull candidate corpus from Neo4j (Incidents + RootCauses).
+    corpus = run_cypher(
+        """
+MATCH (i:Incident)
+OPTIONAL MATCH (i)-[:AFFECTS]->(s:Service)
+OPTIONAL MATCH (s)-[:CAUSED_BY]->(r:RootCause)
+RETURN i.id AS id, i.title AS title, i.severity AS severity, i.status AS status,
+       s.name AS service,
+       collect(DISTINCT r.type)        AS cause_types,
+       collect(DISTINCT r.description) AS cause_desc
+"""
+    )
+
+    scored: list[dict] = []
+    for row in corpus:
+        text_parts = [row.get("title") or "", row.get("service") or ""]
+        text_parts += [t for t in (row.get("cause_types") or []) if t]
+        text_parts += [d for d in (row.get("cause_desc") or []) if d]
+        doc = _tokens(" ".join(text_parts))
+        s = _score(qterms, doc)
+        if s > 0:
+            row["_score"] = round(s, 4)
+            scored.append(row)
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda r: r["_score"], reverse=True)
+    top = scored[:5]
+
+    # Graph expansion for the top hit (service -> downstream deps, owner, deployment).
+    expansion: list[dict] = []
+    lead_service = next((r["service"] for r in top if r.get("service")), None)
+    lead_incident = top[0]["id"]
+    if lead_service:
+        expansion = run_cypher(
+            """
+MATCH (s:Service {name:$svc})
+OPTIONAL MATCH (s)-[:DEPENDS_ON*1..2]->(d:Service)
+OPTIONAL MATCH (t:Team)-[:OWNS]->(s)
+OPTIONAL MATCH (i:Incident {id:$iid})-[:INTRODUCED_BY]->(dep:Deployment)
+RETURN s.name   AS service,
+       collect(DISTINCT d.name)[0..8] AS downstream,
+       t.name   AS owner_team,
+       dep.version AS deployment
+""",
+            {"svc": lead_service, "iid": lead_incident},
+        )
+
+    # Synthesize grounded answer.
+    hit_line = "; ".join(
+        f"{r['id']} (sev {r['severity']}, {r['service'] or 'no-service'}, score {r['_score']})"
+        for r in top
+    )
+    if expansion:
+        e = expansion[0]
+        down = ", ".join(e.get("downstream") or []) or "(none)"
+        owner = e.get("owner_team") or "unknown team"
+        depline = f" via deployment {e['deployment']}" if e.get("deployment") else ""
+        graph_line = (
+            f" Graph expansion on {e['service']}: downstream={down}; owner={owner}{depline}."
+        )
+    else:
+        graph_line = ""
+
+    answer = (
+        f"Hybrid search found {len(scored)} candidate(s) for your question. "
+        f"Top matches: {hit_line}.{graph_line}"
+    )
+    evidence = [
+        {
+            "id": r["id"], "title": r["title"], "severity": r["severity"],
+            "service": r["service"], "causes": r.get("cause_types"),
+            "score": r["_score"],
+        }
+        for r in top
+    ]
+    if expansion:
+        evidence.append({"graph_expansion": expansion[0]})
+    return (answer, evidence)
+
+
 HANDLERS = [
     h_by_root_cause,      # DNS, CPU, MemLeak, etc.
     h_impact_count,       # > N services
@@ -353,7 +496,8 @@ HANDLERS = [
     h_cycles,
     h_owner,
     h_dependents,
-    h_incidents_on_service,  # fallback when a service is mentioned
+    h_incidents_on_service,  # when a service alias is mentioned
+    h_hybrid_search,         # catch-all: vector-style + graph expansion
 ]
 
 
