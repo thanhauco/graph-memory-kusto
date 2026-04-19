@@ -43,3 +43,13 @@ venv/
 *.bak
 .coverage
 coverage/
+
+# .NET
+bin/
+obj/
+*.user
+
+# Next.js generated
+frontend-nextjs/.next/
+frontend-nextjs/out/
+frontend-nextjs/node_modules/
