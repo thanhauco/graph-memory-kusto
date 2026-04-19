@@ -1228,7 +1228,14 @@ function GraphVizPanel(){
         const dim = focusedMode && !isSel && !isNeighbor;
         if(dim) continue;
         const baseR = n.label==="Service" ? 8 : n.label==="Team" ? 7 : n.label==="RootCause" ? 6 : 4;
-        const txt = n.name || n.id;
+        // For incidents, lead with the canonical id (e.g. "INC-1008") so the
+        // user can match it to chat answers; append the title when selected/hovered.
+        let txt;
+        if(n.label === "Incident"){
+          txt = (isSel || isHover) && n.name ? `${n.id} · ${n.name}` : n.id;
+        } else {
+          txt = n.name || n.id;
+        }
         ctx.font = isSel ? "bold 12px ui-sans-serif" : "11px ui-sans-serif";
         const w = ctx.measureText(txt).width;
         const lx = n.x + baseR + 4, ly = n.y + 3;
