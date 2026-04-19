@@ -976,7 +976,7 @@ function GraphVizPanel(){
   const [maxIncidents,setMaxIncidents] = useState(60);
   const [search,setSearch] = useState("");
   const [hoverId,setHoverId] = useState(null);
-  const simRef = useRef({nodes:[], links:[], raf:0, dragging:null, pan:{x:0,y:0}, zoom:1});
+  const simRef = useRef({nodes:[], links:[], raf:0, dragging:null, pan:{x:0,y:0}, zoom:1, alpha:1});
 
   // fetch snapshot
   useEffect(()=>{
@@ -1018,6 +1018,7 @@ function GraphVizPanel(){
     }
     simRef.current.nodes = [...nodeMap.values()];
     simRef.current.links = links;
+    simRef.current.alpha = 1; // reheat whenever the graph is rebuilt
   },[snap, labels, maxIncidents, search]);
 
   // force simulation loop
@@ -1035,41 +1036,54 @@ function GraphVizPanel(){
     window.addEventListener("resize", fit);
 
     const tick = ()=>{
-      const {nodes, links, pan, zoom} = simRef.current;
+      const s = simRef.current;
+      const {nodes, links, pan, zoom} = s;
       const w = cvs.clientWidth, h = cvs.clientHeight;
       const cx = w/2, cy = h/2;
-      // repulsion
-      for(let i=0;i<nodes.length;i++){
-        const a = nodes[i];
-        for(let j=i+1;j<nodes.length;j++){
-          const b = nodes[j];
-          let dx = a.x-b.x, dy = a.y-b.y;
-          let d2 = dx*dx+dy*dy + 0.01;
-          if(d2 > 40000) continue; // ignore very far
-          const f = charge / d2;
-          const d = Math.sqrt(d2);
+
+      // Only compute physics while "hot" (alpha > 0) or while dragging.
+      const physicsOn = s.alpha > 0.005 || s.dragging;
+
+      if(physicsOn){
+        const a0 = s.alpha;
+        // repulsion
+        for(let i=0;i<nodes.length;i++){
+          const a = nodes[i];
+          for(let j=i+1;j<nodes.length;j++){
+            const b = nodes[j];
+            let dx = a.x-b.x, dy = a.y-b.y;
+            let d2 = dx*dx+dy*dy + 0.01;
+            if(d2 > 40000) continue;
+            const f = charge * a0 / d2;
+            const d = Math.sqrt(d2);
+            const fx = f * dx/d, fy = f * dy/d;
+            a.vx += fx; a.vy += fy;
+            b.vx -= fx; b.vy -= fy;
+          }
+        }
+        // springs
+        for(const l of links){
+          const dx = l.target.x - l.source.x, dy = l.target.y - l.source.y;
+          const d = Math.sqrt(dx*dx+dy*dy) + 0.01;
+          const f = (d - linkDist) * 0.02 * a0;
           const fx = f * dx/d, fy = f * dy/d;
-          a.vx += fx; a.vy += fy;
-          b.vx -= fx; b.vy -= fy;
+          l.source.vx += fx; l.source.vy += fy;
+          l.target.vx -= fx; l.target.vy -= fy;
         }
-      }
-      // springs
-      for(const l of links){
-        const dx = l.target.x - l.source.x, dy = l.target.y - l.source.y;
-        const d = Math.sqrt(dx*dx+dy*dy) + 0.01;
-        const f = (d - linkDist) * 0.02;
-        const fx = f * dx/d, fy = f * dy/d;
-        l.source.vx += fx; l.source.vy += fy;
-        l.target.vx -= fx; l.target.vy -= fy;
-      }
-      // gravity + integrate
-      for(const n of nodes){
-        n.vx += (0 - n.x) * 0.002;
-        n.vy += (0 - n.y) * 0.002;
-        n.vx *= 0.85; n.vy *= 0.85;
-        if(simRef.current.dragging !== n){
-          n.x += n.vx; n.y += n.vy;
+        // gravity + integrate with strong damping
+        for(const n of nodes){
+          n.vx += (0 - n.x) * 0.002 * a0;
+          n.vy += (0 - n.y) * 0.002 * a0;
+          n.vx *= 0.72; n.vy *= 0.72;
+          if(s.dragging !== n){
+            n.x += n.vx; n.y += n.vy;
+          } else {
+            n.vx = n.vy = 0;
+          }
         }
+        // cool the system; while dragging keep it slightly warm
+        if(s.dragging){ s.alpha = Math.max(s.alpha, 0.3); }
+        else { s.alpha *= 0.94; if(s.alpha < 0.005) s.alpha = 0; }
       }
       // draw
       ctx.clearRect(0,0,w,h);
@@ -1124,7 +1138,7 @@ function GraphVizPanel(){
     const mx = (e.clientX - r.left - r.width/2 - pan.x) / zoom;
     const my = (e.clientY - r.top  - r.height/2 - pan.y) / zoom;
     const hit = nodes.find(n => (n.x-mx)**2 + (n.y-my)**2 < 100);
-    if(hit){ simRef.current.dragging = hit; }
+    if(hit){ simRef.current.dragging = hit; simRef.current.alpha = 0.6; }
     else   { simRef.current.panning = {x: e.clientX, y: e.clientY, pan0:{...pan}}; }
   };
   const onPointerMove = e => {
@@ -1256,6 +1270,11 @@ function GraphVizPanel(){
         <div className="text-[11px] text-slate-400 leading-relaxed mt-2">
           drag nodes · scroll to zoom · drag background to pan · hover for details
         </div>
+        <button
+          onClick={()=>{ simRef.current.alpha = 1; }}
+          className="mt-3 w-full px-3 py-1.5 rounded-md bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold">
+          Reheat layout
+        </button>
       </Card>
     </div>
   );
