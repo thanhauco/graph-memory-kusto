@@ -1042,8 +1042,8 @@ const PARTS = {
 function App(){
   const [part,setPart] = useState("Core");
   const [tab,setTab] = useState(PARTS["Core"][0].id);
-  useEffect(()=>{ setTab(PARTS[part][0].id); },[part]);
-  const active = PARTS[part].find(t=>t.id===tab);
+  const active = PARTS[part].find(t=>t.id===tab) || PARTS[part][0];
+  const switchPart = p => { setPart(p); setTab(PARTS[p][0].id); };
 
   return (
     <div className="min-h-screen">
@@ -1069,7 +1069,7 @@ function App(){
         {/* part tabs */}
         <div className="max-w-7xl mx-auto px-5 flex gap-1">
           {Object.keys(PARTS).map(p=>(
-            <button key={p} onClick={()=>setPart(p)}
+            <button key={p} onClick={()=>switchPart(p)}
               className={`px-4 py-2 text-sm font-semibold border-b-2 transition-colors
                 ${part===p?"border-violet-500 text-white":"border-transparent text-slate-400 hover:text-slate-200"}`}>
               {p}
