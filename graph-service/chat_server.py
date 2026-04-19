@@ -412,6 +412,82 @@ ORDER BY i.createdDate DESC LIMIT 20
     return (f"{len(rows)} incident(s) affecting {svc}: {sample}.", rows)
 
 
+# Conjunctive keyword filters.  "outage" is treated as severity <= 2 OR title
+# mentions outage (there isn't an explicit outage label in the seed).
+_CONCEPT_FILTERS = {
+    "outage":        "(i.severity <= 2 OR toLower(i.title) CONTAINS 'outage')",
+    "critical":      "i.severity = 1",
+    "high severity": "i.severity <= 2",
+    "sev1":          "i.severity = 1",
+    "sev2":          "i.severity <= 2",
+    "open":          "i.status = 'Open'",
+    "mitigated":     "i.status = 'Mitigated'",
+    "active":        "i.status = 'Open'",
+}
+
+def _find_concept(q: str) -> tuple[str, str] | None:
+    low = q.lower()
+    for kw, clause in _CONCEPT_FILTERS.items():
+        if kw in low:
+            return kw, clause
+    return None
+
+
+def h_service_plus_concept(q: str) -> tuple[str, list[dict]] | None:
+    """Conjunctive: incidents matching BOTH a service AND a concept filter or root cause."""
+    low = q.lower()
+    if "incident" not in low and "related" not in low and "belong" not in low:
+        return None
+    svc = extract_service(q)
+    if svc is None:
+        return None
+    rc = extract_root_cause(q)
+    concept = _find_concept(q)
+    if rc is None and concept is None:
+        return None  # defer to simpler handlers
+
+    clauses = []
+    params = {"svc": svc}
+    rc_clause = ""
+    if rc is not None:
+        rc_clause = "MATCH (s)-[:CAUSED_BY]->(r:RootCause {type:$rc})"
+        params["rc"] = rc
+    if concept is not None:
+        clauses.append(concept[1])
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    cypher = f"""
+MATCH (i:Incident)-[:AFFECTS]->(s:Service {{name:$svc}})
+{rc_clause}
+{where}
+RETURN DISTINCT i.id AS id, i.title AS title, i.severity AS severity,
+       i.status AS status, s.name AS service
+ORDER BY i.severity, i.id LIMIT 25
+"""
+    rows = traced_cypher(
+        cypher, params,
+        note=f"service+concept filter svc={svc}"
+             + (f", root_cause={rc}" if rc else "")
+             + (f", concept={concept[0]}" if concept else "")
+    )
+
+    filters_desc = []
+    if rc:
+        filters_desc.append(f"root cause = {rc}")
+    if concept:
+        filters_desc.append(f"{concept[0]}")
+    fstr = " AND ".join(filters_desc)
+
+    if not rows:
+        return (f"No incidents on {svc} match {fstr}.", [])
+    sample = ", ".join(f"{r['id']} (sev {r['severity']})" for r in rows[:6])
+    more = "" if len(rows) <= 6 else f" ... and {len(rows)-6} more"
+    return (
+        f"{len(rows)} incident(s) on {svc} matching {fstr}: {sample}{more}.",
+        rows,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hybrid search: lexical/"vector-style" scoring over Incident+RootCause text,
 # fused with graph expansion (affected service, downstream deps, owning team,
@@ -534,6 +610,7 @@ RETURN s.name   AS service,
 
 
 HANDLERS = [
+    h_service_plus_concept,  # conjunctive: service AND (root_cause | outage | sev) — FIRST
     h_by_root_cause,      # DNS, CPU, MemLeak, etc.
     h_impact_count,       # > N services
     h_blast_radius,
