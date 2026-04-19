@@ -928,6 +928,36 @@ function AuditPanel(){
    PART III — ADVANCED
    ========================================================= */
 
+/* Minimal markdown -> HTML renderer for chat answers.
+   Supports: **bold**, *italic*, `code`, bullet lists, blank-line paragraphs. */
+function renderMarkdown(src){
+  if(!src) return "";
+  const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const inline = s => esc(s)
+    .replace(/`([^`]+)`/g,'<code class="px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-emerald-300 text-[12px]">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong class="text-white">$1</strong>')
+    .replace(/\*([^*]+)\*/g,'<em class="text-slate-300">$1</em>');
+  const lines = src.split(/\r?\n/);
+  const html = [];
+  let inList = false;
+  const closeList = () => { if(inList){ html.push("</ul>"); inList = false; } };
+  for(const raw of lines){
+    const line = raw.trimEnd();
+    if(/^\s*-\s+/.test(line)){
+      if(!inList){ html.push('<ul class="list-disc ml-5 space-y-1 my-1">'); inList = true; }
+      html.push("<li>"+inline(line.replace(/^\s*-\s+/,""))+"</li>");
+    } else if(line === ""){
+      closeList();
+      html.push("<div class='h-1'></div>");
+    } else {
+      closeList();
+      html.push('<p class="my-1">'+inline(line)+"</p>");
+    }
+  }
+  closeList();
+  return html.join("");
+}
+
 function AgentChatPanel(){
   const [msgs,setMsgs] = useState([
     { role:"sys", text:"Graph-grounded chat. Questions are translated to Cypher and executed against live Neo4j (bolt://localhost:7688). If the chat_server is offline the panel falls back to in-browser rules." },
@@ -993,7 +1023,10 @@ function AgentChatPanel(){
               <div className={`max-w-[80%] px-3 py-2 rounded-lg text-sm
                 ${m.role==="user"?"bg-violet-600 text-white":
                   m.role==="sys"?"bg-slate-800/50 text-slate-400 text-xs italic":"bg-slate-800 text-slate-100"}`}>
-                <div className="whitespace-pre-wrap">{m.text}</div>
+                {m.role==="asst"
+                  ? <div className="leading-relaxed"
+                         dangerouslySetInnerHTML={{__html: renderMarkdown(m.text)}}/>
+                  : <div className="whitespace-pre-wrap">{m.text}</div>}
                 {m.trace && (
                   <details className="mt-2 border-t border-slate-700 pt-2">
                     <summary className="text-[11px] text-emerald-400 cursor-pointer select-none">

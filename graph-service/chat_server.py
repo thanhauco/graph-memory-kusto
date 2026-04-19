@@ -218,12 +218,16 @@ ORDER BY i.severity, i.id LIMIT 25
     rows = traced_cypher(cypher, {"rc": rc}, note="by_root_cause:incidents AFFECTS->CAUSED_BY")
     if not rows:
         return (f"No incidents linked to root cause `{rc}` in the current graph.", [])
-    sample = ", ".join(f"{r['id']} ({r['service']})" for r in rows[:6])
-    more = "" if len(rows) <= 6 else f" ... and {len(rows) - 6} more"
-    return (
-        f"Yes. {len(rows)} incident(s) map to root cause `{rc}` via AFFECTS -> CAUSED_BY: {sample}{more}.",
-        rows,
+    bullets = "\n".join(
+        f"- **{r['id']}** — sev {r['severity']} — `{r['service']}` — *{r['title']}*"
+        for r in rows[:8]
     )
+    more = "" if len(rows) <= 8 else f"\n\n_… and {len(rows) - 8} more_"
+    ans = (
+        f"**{len(rows)} incident(s)** linked to root cause `{rc}` via "
+        f"`AFFECTS → CAUSED_BY`:\n\n{bullets}{more}"
+    )
+    return (ans, rows)
 
 
 def h_impact_count(q: str) -> tuple[str, list[dict]] | None:
@@ -247,18 +251,18 @@ ORDER BY cnt DESC LIMIT 12
     rows = traced_cypher(cypher, {"minServices": min_services}, note="impact_count:AFFECTS + DEPENDS_ON*1..3")
     if not rows:
         return (
-            f"No incidents impact {min_services} or more services (direct + 3-hop blast radius).",
+            f"No incidents impact **{min_services}** or more services (direct + {max_hops}-hop blast radius).",
             [],
         )
-    top = rows[0]
-    lines = "; ".join(
-        f"{r['id']} -> {r['impacted_count']} services ({', '.join(r['sample'][:5])})"
+    bullets = "\n".join(
+        f"- **{r['id']}** (sev {r['severity']}) → **{r['impacted_count']}** services — `{', '.join(r['sample'][:5])}`"
         for r in rows[:6]
     )
-    return (
-        f"Yes. {len(rows)} incident(s) impact {min_services}+ services (including dependency cascade up to {max_hops} hops). Top: {lines}.",
-        rows,
+    ans = (
+        f"**{len(rows)} incident(s)** impact **{min_services}+** services "
+        f"(dependency cascade up to **{max_hops} hops**):\n\n{bullets}"
     )
+    return (ans, rows)
 
 
 def h_blast_radius(q: str) -> tuple[str, list[dict]] | None:
@@ -277,12 +281,16 @@ ORDER BY hops, service
 """
     rows = traced_cypher(cypher, {"svc": svc}, note=f"blast_radius:DEPENDS_ON*1..{hops}")
     if not rows:
-        return (f"No downstream dependencies for {svc} up to {hops} hops.", [])
+        return (f"No downstream dependencies for **{svc}** up to {hops} hops.", [])
     by_hop: dict[int, list[str]] = {}
     for r in rows:
         by_hop.setdefault(r["hops"], []).append(r["service"])
-    parts = [f"{h}-hop: {', '.join(sorted(set(v)))}" for h, v in sorted(by_hop.items())]
-    return (f"Blast radius of {svc} ({hops} hops): " + " | ".join(parts) + ".", rows)
+    bullets = "\n".join(
+        f"- **{h}-hop:** `{', '.join(sorted(set(v)))}`"
+        for h, v in sorted(by_hop.items())
+    )
+    ans = f"**Blast radius of `{svc}`** (up to **{hops} hops**):\n\n{bullets}"
+    return (ans, rows)
 
 
 def h_root_cause_of_incident(q: str) -> tuple[str, list[dict]] | None:
@@ -302,17 +310,18 @@ RETURN i.id AS id, s.name AS service,
 """
     rows = traced_cypher(cypher, {"id": inc}, note="rca_of_incident:AFFECTS + DEPENDS_ON + CAUSED_BY")
     if not rows:
-        return (f"{inc} not found in graph.", [])
+        return (f"**{inc}** not found in graph.", [])
     r = rows[0]
     causes = [c for c in r["causes"] if c]
     downstream = [d for d in r["downstream"] if d]
-    cause_str = ", ".join(causes) if causes else "no explicit CAUSED_BY edge"
-    down_str = ", ".join(downstream) if downstream else "(no downstream)"
-    return (
-        f"{inc} affects {r['service']}. Downstream dependencies: {down_str}. "
-        f"Likely root cause(s): {cause_str}.",
-        rows,
+    cause_md = ", ".join(f"`{c}`" for c in causes) if causes else "_no explicit CAUSED_BY edge_"
+    down_md = ", ".join(f"`{d}`" for d in downstream) if downstream else "_none_"
+    ans = (
+        f"**{inc}** affects service **`{r['service']}`**.\n\n"
+        f"- **Downstream dependencies:** {down_md}\n"
+        f"- **Likely root cause(s):** {cause_md}"
     )
+    return (ans, rows)
 
 
 def h_dependents(q: str) -> tuple[str, list[dict]] | None:
@@ -329,9 +338,9 @@ ORDER BY tier, service
 """
     rows = traced_cypher(cypher, {"svc": svc}, note="dependents:inverse DEPENDS_ON")
     if not rows:
-        return (f"No services depend on {svc}.", [])
-    names = ", ".join(r["service"] for r in rows)
-    return (f"{len(rows)} service(s) depend on {svc}: {names}.", rows)
+        return (f"No services depend on **{svc}**.", [])
+    bullets = "\n".join(f"- `{r['service']}` — tier *{r['tier']}*" for r in rows)
+    return (f"**{len(rows)} service(s)** depend on **`{svc}`**:\n\n{bullets}", rows)
 
 
 def h_owner(q: str) -> tuple[str, list[dict]] | None:
@@ -347,12 +356,14 @@ RETURN t.name AS team, t.slackChannel AS channel, t.oncallRotation AS oncall
 """
     rows = traced_cypher(cypher, {"svc": svc}, note="owner:Team-OWNS->Service")
     if not rows:
-        return (f"{svc} has no owning team in the graph.", [])
+        return (f"**{svc}** has no owning team in the graph.", [])
     t = rows[0]
-    return (
-        f"{svc} is owned by {t['team']} (channel {t['channel']}, oncall {t['oncall']}).",
-        rows,
+    ans = (
+        f"**`{svc}`** is owned by **{t['team']}**.\n\n"
+        f"- **Slack:** `{t['channel']}`\n"
+        f"- **On-call rotation:** {t['oncall']}"
     )
+    return (ans, rows)
 
 
 def h_cycles(q: str) -> tuple[str, list[dict]] | None:
@@ -367,9 +378,9 @@ ORDER BY hops LIMIT 5
 """
     rows = traced_cypher(cypher, note="cycles:DEPENDS_ON*2..8 self-loop")
     if not rows:
-        return ("No dependency cycles detected in :DEPENDS_ON (depth 2..8).", [])
-    sample = "; ".join(" -> ".join(r["cycle"]) for r in rows[:3])
-    return (f"{len(rows)} dependency cycle(s) detected: {sample}.", rows)
+        return ("No dependency cycles detected in `:DEPENDS_ON` (depth 2..8).", [])
+    bullets = "\n".join(f"- `{' → '.join(r['cycle'])}` ({r['hops']} hops)" for r in rows[:5])
+    return (f"**{len(rows)} dependency cycle(s)** detected:\n\n{bullets}", rows)
 
 
 def h_regressions(q: str) -> tuple[str, list[dict]] | None:
@@ -386,11 +397,11 @@ ORDER BY d.deployedAt DESC LIMIT 15
     rows = traced_cypher(cypher, note="regressions:INTRODUCED_BY + AFFECTS")
     if not rows:
         return ("No regressions linked to deployments in the current window.", [])
-    sample = "; ".join(
-        f"{r['incident']} via {r['version']} -> {r['service']} (sev {r['severity']})"
-        for r in rows[:5]
+    bullets = "\n".join(
+        f"- **{r['incident']}** (sev {r['severity']}) via deployment `{r['version']}` → `{r['service']}`"
+        for r in rows[:6]
     )
-    return (f"{len(rows)} regression(s) attributed to deployments. Recent: {sample}.", rows)
+    return (f"**{len(rows)} regression(s)** attributed to deployments:\n\n{bullets}", rows)
 
 
 def h_incidents_on_service(q: str) -> tuple[str, list[dict]] | None:
@@ -407,9 +418,16 @@ ORDER BY i.createdDate DESC LIMIT 20
 """
     rows = traced_cypher(cypher, {"svc": svc}, note="incidents_on_service:AFFECTS")
     if not rows:
-        return (f"No incidents found affecting {svc}.", [])
-    sample = ", ".join(f"{r['id']} (sev {r['severity']})" for r in rows[:6])
-    return (f"{len(rows)} incident(s) affecting {svc}: {sample}.", rows)
+        return (f"No incidents found affecting **{svc}**.", [])
+    bullets = "\n".join(
+        f"- **{r['id']}** — sev {r['severity']} — *{r['status']}* — {r['title']}"
+        for r in rows[:8]
+    )
+    more = "" if len(rows) <= 8 else f"\n\n_… and {len(rows)-8} more_"
+    return (
+        f"**{len(rows)} incident(s)** affecting **`{svc}`**:\n\n{bullets}{more}",
+        rows,
+    )
 
 
 # Conjunctive keyword filters.  "outage" is treated as severity <= 2 OR title
@@ -473,17 +491,20 @@ ORDER BY i.severity, i.id LIMIT 25
 
     filters_desc = []
     if rc:
-        filters_desc.append(f"root cause = {rc}")
+        filters_desc.append(f"root cause = `{rc}`")
     if concept:
-        filters_desc.append(f"{concept[0]}")
+        filters_desc.append(f"**{concept[0]}**")
     fstr = " AND ".join(filters_desc)
 
     if not rows:
-        return (f"No incidents on {svc} match {fstr}.", [])
-    sample = ", ".join(f"{r['id']} (sev {r['severity']})" for r in rows[:6])
-    more = "" if len(rows) <= 6 else f" ... and {len(rows)-6} more"
+        return (f"No incidents on **`{svc}`** match {fstr}.", [])
+    bullets = "\n".join(
+        f"- **{r['id']}** — sev {r['severity']} — *{r['status']}* — {r['title']}"
+        for r in rows[:8]
+    )
+    more = "" if len(rows) <= 8 else f"\n\n_… and {len(rows)-8} more_"
     return (
-        f"{len(rows)} incident(s) on {svc} matching {fstr}: {sample}{more}.",
+        f"**{len(rows)} incident(s)** on **`{svc}`** matching {fstr}:\n\n{bullets}{more}",
         rows,
     )
 
@@ -577,24 +598,25 @@ RETURN s.name   AS service,
         )
 
     # Synthesize grounded answer.
-    hit_line = "; ".join(
-        f"{r['id']} (sev {r['severity']}, {r['service'] or 'no-service'}, score {r['_score']})"
+    hit_bullets = "\n".join(
+        f"- **{r['id']}** — sev {r['severity']} — `{r['service'] or 'no-service'}` — score **{r['_score']}**"
         for r in top
     )
+    graph_line = ""
     if expansion:
         e = expansion[0]
-        down = ", ".join(e.get("downstream") or []) or "(none)"
-        owner = e.get("owner_team") or "unknown team"
-        depline = f" via deployment {e['deployment']}" if e.get("deployment") else ""
+        down = ", ".join(f"`{d}`" for d in (e.get("downstream") or [])) or "_none_"
+        owner = e.get("owner_team") or "_unknown team_"
+        depline = f" — deployment `{e['deployment']}`" if e.get("deployment") else ""
         graph_line = (
-            f" Graph expansion on {e['service']}: downstream={down}; owner={owner}{depline}."
+            f"\n\n**Graph expansion on `{e['service']}`:**\n"
+            f"- **Downstream:** {down}\n"
+            f"- **Owner:** {owner}{depline}"
         )
-    else:
-        graph_line = ""
 
     answer = (
-        f"Hybrid search found {len(scored)} candidate(s) for your question. "
-        f"Top matches: {hit_line}.{graph_line}"
+        f"**Hybrid search** found **{len(scored)} candidate(s)** for your question.\n\n"
+        f"**Top matches:**\n{hit_bullets}{graph_line}"
     )
     evidence = [
         {
