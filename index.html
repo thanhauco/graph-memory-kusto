@@ -124,6 +124,39 @@ function answerNlQuery(text, context){
   const incident = extractIncidentId(raw) || context.lastIncident;
   const service = extractServiceName(raw) || context.lastService || (incident && INCIDENT_FACTS[incident]?.service) || null;
 
+  if((lower.includes("incident") || lower.includes("incidents")) &&
+     (lower.includes("impact") || lower.includes("affect")) &&
+     (lower.includes(">") || lower.includes("more than") || lower.includes("over")) &&
+     lower.includes("service")){
+    const nMatch = lower.match(/(?:>|more than|over)\s*(\d+)/);
+    const minServices = nMatch ? parseInt(nMatch[1], 10) + 1 : 3;
+    const ranked = Object.entries(INCIDENT_FACTS)
+      .map(([id, f]) => {
+        const radius = buildBlastRadius(f.service, 3);
+        const impacted = Array.from(new Set([f.service, ...radius.map(r => r.name)]));
+        return { id, service: f.service, impactedCount: impacted.length, impacted };
+      })
+      .filter(x => x.impactedCount >= minServices)
+      .sort((a, b) => b.impactedCount - a.impactedCount)
+      .slice(0, 6);
+
+    if(ranked.length === 0){
+      return {
+        text: `No incidents found impacting ${minServices} or more services in the current demo window.`,
+        ctx: { lastIncident: incident, lastService: service }
+      };
+    }
+
+    const lines = ranked.map(x =>
+      `${x.id} (${x.service}) impacts ${x.impactedCount} services: ${x.impacted.slice(0, 6).join(", ")}${x.impacted.length > 6 ? "..." : ""}`
+    );
+
+    return {
+      text: `Yes. Incidents impacting ${minServices} or more services (direct + dependency blast radius): ${lines.join(" | ")}`,
+      ctx: { lastIncident: ranked[0].id, lastService: ranked[0].service }
+    };
+  }
+
   if((lower.includes("root cause") || lower.includes("why") || lower.includes("fail")) && incident && INCIDENT_FACTS[incident]){
     const f = INCIDENT_FACTS[incident];
     return {
