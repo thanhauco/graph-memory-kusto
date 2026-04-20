@@ -540,6 +540,128 @@ def _score(query_terms: set[str], doc_terms: list[str]) -> float:
     return hit / (1.0 + 0.25 * len(doc_terms))
 
 
+def h_multi_team_incidents(q: str) -> tuple[str, list[dict]] | None:
+    """Incidents whose affected services span more than N owning teams.
+
+    Triggers on phrases like:
+      - "incidents belong to more than 2 teams"
+      - "incidents belong to >2 teams"
+      - "incidents spanning multiple teams"
+      - "incidents across more than 1 team"
+      - "cross-team incidents"
+      - "incidents involving several teams"
+    Path: (i:Incident)-[:AFFECTS]->(:Service)<-[:OWNS]-(:Team) and/or
+          (i)-[:AFFECTS]->(:Service)-[:DEPENDS_ON*1..2]->(:Service)<-[:OWNS]-(:Team)
+    """
+    low = q.lower()
+    mentions_team = ("team" in low or "teams" in low)
+    if not mentions_team:
+        return None
+    cross_words = (
+        "more than", "over", ">", "multiple", "several",
+        "cross-team", "cross team", "spanning", "across",
+        "involving", "belong to", "belonging to",
+    )
+    if not any(w in low for w in cross_words):
+        return None
+
+    # Threshold: "more than 2 teams" -> 2 (strict >), "multiple" -> 1
+    n = extract_int_after(q, ["more than", "over", ">", "at least", "greater than"])
+    if n is None:
+        n = 1  # "multiple"/"several"/"cross-team" => >1 team
+    strict_gt = n  # WHERE team_count > n
+
+    # Include 2-hop dependency closure so "belongs to" is interpreted broadly
+    # (direct service owner + owners of downstream dependencies the incident
+    # propagates through). This is a graph-native query — a vector store can't
+    # express "distinct team count over an incident's dependency closure".
+    cypher = """
+MATCH (i:Incident)-[:AFFECTS]->(s:Service)
+OPTIONAL MATCH (s)-[:DEPENDS_ON*0..2]->(s2:Service)<-[:OWNS]-(t:Team)
+WITH i, s, collect(DISTINCT t.name) AS teams
+WITH i, s.name AS service, teams, size(teams) AS team_count
+WHERE team_count > $n
+RETURN i.id AS id, i.title AS title, i.severity AS severity, i.status AS status,
+       service, teams, team_count
+ORDER BY team_count DESC, i.severity, i.id
+LIMIT 25
+"""
+    rows = traced_cypher(cypher, {"n": strict_gt}, note="multi_team_incidents:AFFECTS + DEPENDS_ON*0..2 <-OWNS- Team")
+    if not rows:
+        return (
+            f"No incidents span **more than {strict_gt}** owning team(s) "
+            f"(affected service + up to 2 hops of its dependencies).",
+            [],
+        )
+    bullets = "\n".join(
+        f"- **{r['id']}** — sev {r['severity']} — *{r['status']}* — `{r['service']}` → "
+        f"**{r['team_count']} teams**: {', '.join(r['teams'])} — *{r['title']}*"
+        for r in rows[:10]
+    )
+    more = "" if len(rows) <= 10 else f"\n\n_… and {len(rows) - 10} more_"
+    ans = (
+        f"**{len(rows)} incident(s)** whose affected service + 2-hop dependency "
+        f"closure is owned by **more than {strict_gt}** distinct team(s):\n\n"
+        f"{bullets}{more}"
+    )
+    return (ans, rows)
+
+
+def h_orphan_incidents(q: str) -> tuple[str, list[dict]] | None:
+    """Incidents with no :AFFECTS edge to any Service (data-quality / orphan check).
+
+    Triggers on phrases like:
+      - "any incidents not belong to any service"
+      - "incidents without a service"
+      - "orphan incidents"
+      - "incidents missing service"
+      - "incidents with no service"
+      - "unlinked incidents"
+    """
+    low = q.lower()
+    triggers = (
+        "not belong to any service",
+        "not belong to a service",
+        "without a service",
+        "without any service",
+        "with no service",
+        "no service attached",
+        "missing service",
+        "orphan incident",
+        "orphaned incident",
+        "unlinked incident",
+        "unattached incident",
+        "incidents not linked",
+        "incidents not attached",
+    )
+    if not any(t in low for t in triggers):
+        return None
+    cypher = """
+MATCH (i:Incident)
+WHERE NOT (i)-[:AFFECTS]->(:Service)
+RETURN i.id AS id, i.title AS title, i.severity AS severity, i.status AS status
+ORDER BY i.severity, i.id
+LIMIT 50
+"""
+    rows = traced_cypher(cypher, {}, note="orphan_incidents:Incident no AFFECTS->Service")
+    if not rows:
+        return (
+            "**All 400 incidents are linked to at least one service** via `:AFFECTS`. "
+            "No orphans — the data is clean.",
+            [],
+        )
+    bullets = "\n".join(
+        f"- **{r['id']}** — sev {r['severity']} — *{r['status']}* — {r['title']}"
+        for r in rows[:10]
+    )
+    more = "" if len(rows) <= 10 else f"\n\n_… and {len(rows) - 10} more_"
+    ans = (
+        f"**{len(rows)} orphan incident(s)** — no `:AFFECTS` edge to any `Service`:\n\n"
+        f"{bullets}{more}"
+    )
+    return (ans, rows)
+
+
 def h_hybrid_search(q: str) -> tuple[str, list[dict]] | None:
     """Lexical (vector-style) ranking fused with graph neighborhood expansion."""
     qterms = set(_tokens(q))
@@ -933,6 +1055,8 @@ HANDLERS = [
     h_owner,
     h_dependents,
     h_incidents_on_service,  # when a service alias is mentioned
+    h_multi_team_incidents,  # incidents spanning >N owning teams
+    h_orphan_incidents,      # incidents with no AFFECTS edge
     h_hybrid_search,         # catch-all: vector-style + graph expansion
 ]
 

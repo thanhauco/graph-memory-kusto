@@ -1945,6 +1945,14 @@ function App(){
   const active = PARTS[part].find(t=>t.id===tab) || PARTS[part][0];
   const switchPart = p => { setPart(p); setTab(PARTS[p][0].id); };
 
+  // Flatten every panel once. We render ALL of them permanently so that each
+  // panel's React state (chat history, graph layout, scroll, hover, etc.) is
+  // preserved when the user switches tabs. Only the active one is visible.
+  const ALL = useMemo(
+    () => Object.values(PARTS).flat(),
+    []
+  );
+
   // Global hook: chat answers call this when a user clicks an INC-xxxx chip.
   // It switches to the Graph Viewer tab and asks the panel to focus that node.
   useEffect(()=>{
@@ -2002,7 +2010,13 @@ function App(){
             </button>
           ))}
         </div>
-        {active.cmp}
+        {/* All panels rendered & kept mounted so state (chat, graph, scroll)
+            persists across tab switches. Inactive panels are display:none. */}
+        {ALL.map(t=>(
+          <div key={t.id} style={{display: t.id===tab ? "block" : "none"}}>
+            {t.cmp}
+          </div>
+        ))}
 
         <footer className="mt-10 text-center text-xs text-slate-500">
           GraphRAG + MemMachine Hybrid · dev scaffold built with React 18 + Tailwind (CDN) · just open <code className="text-slate-300">index.html</code>
