@@ -933,13 +933,39 @@ function AuditPanel(){
 function renderMarkdown(src){
   if(!src) return "";
   const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  // Linkify INC-xxxx references into clickable chips that focus the Graph Viewer.
-  const linkify = s => s.replace(/\b(INC-\d+)\b/g,
-    '<a href="#" class="gv-focus px-1 rounded bg-rose-500/15 border border-rose-500/40 text-rose-200 hover:bg-rose-500/30 no-underline" data-gv-id="$1" onclick="return window.__gvFocus &amp;&amp; window.__gvFocus(\'$1\')">$1</a>');
-  const inline = s => linkify(esc(s)
-    .replace(/`([^`]+)`/g,'<code class="px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-emerald-300 text-[12px]">$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g,'<strong class="text-white">$1</strong>')
-    .replace(/\*([^*]+)\*/g,'<em class="text-slate-300">$1</em>'));
+  // Per-label styles for the focus chips.
+  const CHIP_STYLE = {
+    Incident:   "bg-rose-500/15 border-rose-500/40 text-rose-200 hover:bg-rose-500/30",
+    Service:    "bg-sky-500/15 border-sky-500/40 text-sky-200 hover:bg-sky-500/30",
+    Team:       "bg-amber-500/15 border-amber-500/40 text-amber-200 hover:bg-amber-500/30",
+    RootCause:  "bg-fuchsia-500/15 border-fuchsia-500/40 text-fuchsia-200 hover:bg-fuchsia-500/30",
+    Deployment: "bg-emerald-500/15 border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30",
+  };
+  const mkChip = (id,label,text) => {
+    const cls = CHIP_STYLE[label] || CHIP_STYLE.Incident;
+    const t = text == null ? id : text;
+    return `<a href="#" class="gv-focus px-1 rounded border no-underline ${cls}" data-gv-id="${id}" data-gv-label="${label||""}" onclick="return window.__gvFocus &amp;&amp; window.__gvFocus('${id.replace(/'/g,"\\'")}')">${t}</a>`;
+  };
+  // Linkify INC-xxxx unconditionally (Incidents aren't always in the snapshot).
+  const linkifyIncidents = s => s.replace(/\b(INC-\d+)\b/g, (_m,id)=>mkChip(id,"Incident",id));
+  // Linkify known Service/Team/RootCause/Deployment names that appear inside
+  // `backticks` (the chat_server wraps them) using the live graph index.
+  const linkifyKnown = s => s.replace(
+    /<code class="[^"]*">([^<]+)<\/code>/g,
+    (m, inner)=>{
+      const idx = (typeof window !== "undefined" && window.__gvIndex) || {};
+      const label = idx[inner];
+      if(!label) return m; // not a known graph node — leave as plain code
+      return mkChip(inner, label, inner);
+    }
+  );
+  const inline = s => {
+    const withCode = esc(s)
+      .replace(/`([^`]+)`/g,'<code class="px-1 py-0.5 rounded bg-slate-900 border border-slate-700 text-emerald-300 text-[12px]">$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g,'<strong class="text-white">$1</strong>')
+      .replace(/\*([^*]+)\*/g,'<em class="text-slate-300">$1</em>');
+    return linkifyIncidents(linkifyKnown(withCode));
+  };
   const lines = src.split(/\r?\n/);
   const html = [];
   let inList = false;
@@ -991,7 +1017,13 @@ function GraphVizPanel(){
     const h = e => {
       const id = e.detail && e.detail.id;
       if(!id) return;
-      if(id.startsWith("INC-")) setLabels(l => l.Incident ? l : ({...l, Incident:true}));
+      // Make sure the layer for this node's label is visible so the user
+      // actually sees it after the viewer tab activates.
+      const idx = (typeof window !== "undefined" && window.__gvIndex) || {};
+      const lbl = idx[id] || (id.startsWith("INC-") ? "Incident" : null);
+      if(lbl){
+        setLabels(l => l[lbl] ? l : ({...l, [lbl]: true}));
+      }
       setFocusId(id);
       setHoverId(id);
       // Also select it so neighbors/edges highlight and the pulse fires.
@@ -1017,6 +1049,14 @@ function GraphVizPanel(){
       if(cancel) return;
       setSnap(j);
       setStatus("ok");
+      // Publish a global {id -> label} index so other panels (Agent Chat)
+      // can linkify references to Services, Teams, RootCauses, Deployments.
+      try {
+        const idx = {};
+        for(const n of (j.nodes || [])){ idx[n.id] = n.label; }
+        window.__gvIndex = idx;
+        window.dispatchEvent(new CustomEvent("gv:index"));
+      } catch(_e){}
     }).catch(e=>{
       if(!cancel){ setStatus("offline"); }
     });
