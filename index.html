@@ -1562,6 +1562,20 @@ function AgentChatPanel(){
     "Regressions from deployments that affect BillingAPI downstream",
     "Root cause of the highest-severity incident on SearchSvc",
   ];
+  // Hard multi-hop reasoning queries — these fan out across the graph in ways
+  // that are hard to express in plain Cypher.
+  const hardPresets = [
+    "Q1 cross-team blind spots",
+    "Q2 root cause tier-0 reach",
+    "Q3 silent amplifiers",
+    "Q4 cycles with incidents across teams",
+    "Q5 recurring root cause after deploy",
+    "Q6 blast radius divergence",
+    "Q7 deploy collision chains",
+    "Q8 distance to critical tier-0",
+    "Q9 hidden shared risk pairs",
+    "Q10 reasoning subgraph for INC-1008",
+  ];
   const send = async text => {
     if(!text.trim()) return;
     setMsgs(m=>[...m,{role:"user",text},{role:"asst",text:"…thinking (querying Neo4j)"}]);
@@ -1654,6 +1668,17 @@ function AgentChatPanel(){
           {presets.map(p=>
             <button key={p} onClick={()=>send(p)}
               className="w-full text-left text-xs px-3 py-2 rounded-md border border-slate-800 bg-slate-900/50 hover:bg-slate-800 text-slate-300">{p}</button>)}
+        </div>
+        <h3 className="font-semibold text-white mt-4 mb-2 flex items-center gap-2">
+          <span className="text-rose-400">🔥 Hard multi-hop</span>
+          <span className="text-[10px] text-slate-400 font-normal">(painful in raw Cypher)</span>
+        </h3>
+        <div className="space-y-2">
+          {hardPresets.map(p=>
+            <button key={p} onClick={()=>send(p)}
+              className="w-full text-left text-xs px-3 py-2 rounded-md border border-rose-500/40 bg-rose-500/10 hover:bg-rose-500/20 text-rose-200 font-medium">
+              {p}
+            </button>)}
         </div>
       </Card>
     </div>

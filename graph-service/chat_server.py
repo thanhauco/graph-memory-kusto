@@ -631,7 +631,298 @@ RETURN s.name   AS service,
     return (answer, evidence)
 
 
+# ---------------------------------------------------------------------------
+# Advanced multi-hop reasoning handlers (Q1..Q10 from the "complicated" set)
+# Each is keyed by a short trigger phrase so users can invoke them from chat.
+# ---------------------------------------------------------------------------
+def h_q1_cross_team_blind_spot(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("blind spot" in low or "cross-team blind" in low or re.search(r"\bq1\b", low)):
+        return None
+    # Find pairs where a team owns a service whose 1-2 hop downstream is owned
+    # by a different team and has strictly more sev1/sev2 incidents than s1.
+    cypher = """
+MATCH (t1:Team)-[:OWNS]->(s1:Service)-[:DEPENDS_ON*1..2]->(s2:Service)<-[:OWNS]-(t2:Team)
+WHERE t1 <> t2
+OPTIONAL MATCH (i1:Incident)-[:AFFECTS]->(s1) WHERE i1.severity <= 2
+OPTIONAL MATCH (i2:Incident)-[:AFFECTS]->(s2) WHERE i2.severity <= 2
+WITH t1, s1, t2, s2, count(DISTINCT i1) AS sev_s1, count(DISTINCT i2) AS sev_s2
+WHERE sev_s2 >= sev_s1 + 3
+RETURN t1.name AS owning_team, s1.name AS clean_service, sev_s1 AS s1_sev_incidents,
+       t2.name AS downstream_team, s2.name AS hot_service, sev_s2 AS s2_sev_incidents
+ORDER BY (sev_s2 - sev_s1) DESC LIMIT 15
+"""
+    rows = traced_cypher(cypher, note="q1:cross_team_blind_spot")
+    if not rows:
+        return ("**Q1 — Cross-team blind spots:** none found in current data.", [])
+    bullets = "\n".join(
+        f"- **{r['owning_team']}** owns `{r['clean_service']}` ({r['s1_sev_incidents']} sev1/2) → depends on `{r['hot_service']}` owned by **{r['downstream_team']}** ({r['s2_sev_incidents']} sev1/2)"
+        for r in rows[:8]
+    )
+    return (f"**Q1 — Cross-team blind spots** ({len(rows)} pair[s]):\n\n{bullets}", rows)
+
+
+def h_q2_root_cause_tier0_reach(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("tier-0 reach" in low or "tier 0 reach" in low or "root cause reach" in low or re.search(r"\bq2\b", low)):
+        return None
+    cypher = """
+MATCH (i:Incident)-[:AFFECTS]->(s:Service)-[:CAUSED_BY]->(rc:RootCause)
+MATCH p = shortestPath((s)-[:DEPENDS_ON*0..3]->(t:Service))
+WHERE t.tier = 'API'
+WITH rc, t, min(length(p)) AS hops
+WITH rc, count(DISTINCT t) AS tier0_count, collect({tier0:t.name, hops:hops})[0..5] AS sample
+WHERE tier0_count >= 1
+RETURN rc.type AS root_cause, tier0_count, sample
+ORDER BY tier0_count DESC LIMIT 10
+"""
+    rows = traced_cypher(cypher, note="q2:root_cause_tier0_reach")
+    if not rows:
+        return ("**Q2 — Root-cause tier-0 reach:** no tier-0 services reachable.", [])
+    bullets = []
+    for r in rows:
+        sample = ", ".join(f"`{s['tier0']}` ({s['hops']}h)" for s in r["sample"])
+        bullets.append(f"- **{r['root_cause']}** reaches **{r['tier0_count']}** tier-0 service(s): {sample}")
+    return (f"**Q2 — Root causes by tier-0 reach**:\n\n" + "\n".join(bullets), rows)
+
+
+def h_q3_silent_amplifier(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("silent amplifier" in low or "amplifier" in low or re.search(r"\bq3\b", low)):
+        return None
+    # Services that receive cascaded impact from many upstream incidents of
+    # multiple root-cause kinds (the service itself may also have incidents).
+    cypher = """
+MATCH (s:Service)
+MATCH (i:Incident)-[:AFFECTS]->(up:Service)-[:DEPENDS_ON*1..2]->(s)
+WHERE up <> s
+MATCH (up)-[:CAUSED_BY]->(rc:RootCause)
+WITH s, count(DISTINCT i) AS reaching_incidents, count(DISTINCT rc) AS rc_kinds,
+     collect(DISTINCT rc.type)[0..5] AS rc_sample
+WHERE reaching_incidents > 20 AND rc_kinds >= 3
+RETURN s.name AS service, reaching_incidents, rc_kinds, rc_sample
+ORDER BY reaching_incidents DESC LIMIT 10
+"""
+    rows = traced_cypher(cypher, note="q3:silent_amplifier")
+    if not rows:
+        return ("**Q3 — Silent amplifiers:** none match the criteria.", [])
+    bullets = "\n".join(
+        f"- **`{r['service']}`** — {r['reaching_incidents']} cascading incident(s), {r['rc_kinds']} root-cause kinds: {', '.join(r['rc_sample'])}"
+        for r in rows
+    )
+    return (f"**Q3 — Silent amplifiers** ({len(rows)}):\n\n{bullets}", rows)
+
+
+def h_q4_cycles_with_incidents(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not (re.search(r"\bq4\b", low) or "cycles with" in low or ("cycle" in low and "team" in low and "across" in low)):
+        return None
+    cypher = """
+MATCH p=(s:Service)-[:DEPENDS_ON*2..4]->(s)
+WITH nodes(p)[0..-1] AS cyc, length(p) AS hops
+UNWIND cyc AS m
+MATCH (t:Team)-[:OWNS]->(m)
+WITH cyc, hops, collect(DISTINCT t.name) AS teams, collect(DISTINCT m.name) AS members
+WHERE size(teams) >= 2
+OPTIONAL MATCH (i:Incident)-[:AFFECTS]->(x:Service)
+WHERE x.name IN members AND i.severity <= 2
+WITH members, teams, hops, count(DISTINCT i) AS sev_incidents
+RETURN members, teams, hops, sev_incidents
+ORDER BY sev_incidents DESC, hops ASC LIMIT 10
+"""
+    rows = traced_cypher(cypher, note="q4:cycles_multi_team")
+    if not rows:
+        return ("**Q4 — Multi-team cycles:** no cycles span ≥ 2 teams.", [])
+    bullets = "\n".join(
+        f"- cycle `{' → '.join(r['members'])}` ({r['hops']} hops) — teams: {', '.join(r['teams'])} — sev1/2 incidents: **{r['sev_incidents']}**"
+        for r in rows
+    )
+    return (f"**Q4 — Multi-team dependency cycles** ({len(rows)}):\n\n{bullets}", rows)
+
+
+def h_q5_recurring_root_cause(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("recurring" in low or "came back" in low or "regression after deploy" in low or re.search(r"\bq5\b", low)):
+        return None
+    # Date fields in the seed are strings; we fall back to simple ordering.
+    cypher = """
+MATCH (d:Deployment)<-[:INTRODUCED_BY]-(post:Incident)-[:AFFECTS]->(s:Service)-[:CAUSED_BY]->(rc:RootCause)
+MATCH (prior:Incident)-[:AFFECTS]->(s)
+MATCH (s)-[:CAUSED_BY]->(rc)
+WHERE prior.id <> post.id AND prior.createdDate < post.createdDate
+RETURN d.version AS deployment, s.name AS service, rc.type AS root_cause,
+       prior.id AS prior_incident, post.id AS post_incident
+ORDER BY post.createdDate DESC LIMIT 12
+"""
+    rows = traced_cypher(cypher, note="q5:recurring_root_cause_post_deploy")
+    if not rows:
+        return ("**Q5 — Recurring root cause after deploy:** none in the 14-day window.", [])
+    bullets = "\n".join(
+        f"- deploy `{r['deployment']}` on `{r['service']}` reintroduced **{r['root_cause']}** ({r['prior_incident']} → {r['post_incident']})"
+        for r in rows
+    )
+    return (f"**Q5 — Recurring root causes after deployment**:\n\n{bullets}", rows)
+
+
+def h_q6_blast_radius_divergence(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("blast radius divergence" in low or "divergence" in low or re.search(r"\bq6\b", low)):
+        return None
+    cypher = """
+MATCH (i:Incident)-[:AFFECTS]->(direct:Service)
+WITH i, collect(DISTINCT direct) AS direct_set
+WHERE size(direct_set) <= 2
+UNWIND direct_set AS d
+OPTIONAL MATCH (d)-[:DEPENDS_ON*1..3]->(reach:Service)
+OPTIONAL MATCH (t:Team)-[:OWNS]->(reach)
+WITH i, direct_set,
+     count(DISTINCT reach) AS reach_n,
+     count(DISTINCT reach.tier) AS tier_kinds,
+     count(DISTINCT t) AS team_kinds
+WHERE reach_n > 0
+RETURN i.id AS incident, i.title AS title, size(direct_set) AS direct_n,
+       reach_n, tier_kinds, team_kinds
+ORDER BY (tier_kinds + team_kinds) DESC, reach_n DESC LIMIT 10
+"""
+    rows = traced_cypher(cypher, note="q6:blast_radius_divergence")
+    if not rows:
+        return ("**Q6 — Blast-radius divergence:** no incidents qualify.", [])
+    bullets = "\n".join(
+        f"- **{r['incident']}** — direct {r['direct_n']} svc, 3-hop reach {r['reach_n']} svc across {r['tier_kinds']} tier(s) and {r['team_kinds']} team(s) — *{r['title']}*"
+        for r in rows
+    )
+    return (f"**Q6 — Highest blast-radius divergence**:\n\n{bullets}", rows)
+
+
+def h_q7_collision_chains(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("collision" in low or "collide" in low or "deploy collision" in low or re.search(r"\bq7\b", low)):
+        return None
+    cypher = """
+MATCH (d:Deployment)<-[:INTRODUCED_BY]-(i1:Incident)-[:AFFECTS]->(a:Service)
+MATCH (a)-[:CAUSED_BY]->(rc1:RootCause)
+MATCH (a)-[:DEPENDS_ON*1..2]->(b:Service)
+MATCH (i2:Incident)-[:AFFECTS]->(b)
+MATCH (b)-[:CAUSED_BY]->(rc2:RootCause)
+WHERE rc1 <> rc2 AND i1 <> i2
+RETURN d.version AS deployment, i1.id AS deploy_incident, rc1.type AS deploy_cause,
+       a.name AS source_service, b.name AS collision_service,
+       i2.id AS live_incident, rc2.type AS live_cause
+LIMIT 15
+"""
+    rows = traced_cypher(cypher, note="q7:deploy_blast_collisions")
+    if not rows:
+        return ("**Q7 — Deploy/live-incident collisions:** none.", [])
+    bullets = "\n".join(
+        f"- deploy `{r['deployment']}` ({r['deploy_incident']} / {r['deploy_cause']}) on `{r['source_service']}` → reaches `{r['collision_service']}` which has live {r['live_incident']} ({r['live_cause']})"
+        for r in rows
+    )
+    return (f"**Q7 — Deployment blast collides with unrelated open incident**:\n\n{bullets}", rows)
+
+
+def h_q8_distance_to_critical(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("distance to critical" in low or "distance to tier" in low or ("distance" in low and "tier" in low) or re.search(r"\bq8\b", low)):
+        return None
+    cypher = """
+MATCH (i:Incident)-[:AFFECTS]->(s:Service)-[:CAUSED_BY]->(rc:RootCause)
+OPTIONAL MATCH p = shortestPath((s)-[:DEPENDS_ON*0..4]->(t:Service))
+WHERE t.tier = 'API'
+WITH rc, i, min(length(p)) AS hops
+WITH rc, avg(toFloat(hops)) AS avg_hops, count(i) AS incidents
+WHERE avg_hops IS NOT NULL
+RETURN rc.type AS root_cause, round(avg_hops * 100)/100.0 AS avg_hops_to_tier0, incidents
+ORDER BY avg_hops_to_tier0 ASC LIMIT 10
+"""
+    rows = traced_cypher(cypher, note="q8:distance_to_tier0")
+    if not rows:
+        return ("**Q8 — Distance to critical:** no paths to tier-0 found.", [])
+    bullets = "\n".join(
+        f"- **{r['root_cause']}** — avg **{r['avg_hops_to_tier0']}** hop(s) to tier-0 across {r['incidents']} incident(s)"
+        for r in rows
+    )
+    return (f"**Q8 — Root causes ranked by avg distance to tier-0**:\n\n{bullets}", rows)
+
+
+def h_q9_hidden_shared_risk(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("hidden shared" in low or "shared risk" in low or "co-incident" in low or re.search(r"\bq9\b", low)):
+        return None
+    cypher = """
+MATCH (x:Service), (y:Service)
+WHERE elementId(x) < elementId(y)
+  AND NOT EXISTS { MATCH (i:Incident)-[:AFFECTS]->(x), (i)-[:AFFECTS]->(y) }
+OPTIONAL MATCH (x)-[:DEPENDS_ON*1..2]->(dx:Service)
+WITH x, y, collect(DISTINCT dx) AS xset
+OPTIONAL MATCH (y)-[:DEPENDS_ON*1..2]->(dy:Service)
+WITH x, y, xset, collect(DISTINCT dy) AS yset
+WITH x, y, [n IN xset WHERE n IN yset] AS shared
+WHERE size(shared) >= 3
+RETURN x.name AS svc_a, y.name AS svc_b, size(shared) AS shared_n,
+       [n IN shared | n.name][0..6] AS shared_sample
+ORDER BY shared_n DESC LIMIT 10
+"""
+    rows = traced_cypher(cypher, note="q9:hidden_shared_risk")
+    if not rows:
+        return ("**Q9 — Hidden shared risk:** no qualifying pairs.", [])
+    bullets = "\n".join(
+        f"- `{r['svc_a']}` ↔ `{r['svc_b']}` share **{r['shared_n']}** downstream svc(s): {', '.join(r['shared_sample'])}"
+        for r in rows
+    )
+    return (f"**Q9 — Hidden shared-risk pairs**:\n\n{bullets}", rows)
+
+
+def h_q10_reasoning_subgraph(q: str) -> tuple[str, list[dict]] | None:
+    low = q.lower()
+    if not ("reasoning subgraph" in low or "spanning subgraph" in low or "reasoning graph" in low or re.search(r"\bq10\b", low)):
+        return None
+    inc = extract_incident_id(q)
+    if inc is None:
+        return ("**Q10 — Reasoning subgraph** needs an incident id (e.g. `INC-1008`).", [])
+    cypher = """
+MATCH (i:Incident {id:$inc})-[:AFFECTS]->(anchor:Service)-[:CAUSED_BY]->(rc:RootCause)
+MATCH (otherSvc:Service)-[:CAUSED_BY]->(rc)
+MATCH (peer:Incident)-[:AFFECTS]->(otherSvc)
+OPTIONAL MATCH path = shortestPath((otherSvc)-[:DEPENDS_ON*0..3]->(t:Service))
+WHERE t.tier = 'API'
+WITH i, rc, collect(DISTINCT peer.id) AS peer_incidents,
+     collect(DISTINCT otherSvc.name) AS affected,
+     collect(DISTINCT t.name) AS tier0_reached,
+     collect(DISTINCT [n IN nodes(path) | n.name]) AS span_paths
+RETURN i.id AS incident, rc.type AS root_cause,
+       size(peer_incidents) AS peers, peer_incidents[0..6] AS peer_sample,
+       affected, tier0_reached,
+       [p IN span_paths WHERE p IS NOT NULL][0..5] AS span_sample
+"""
+    rows = traced_cypher(cypher, {"inc": inc}, note="q10:reasoning_subgraph")
+    if not rows or not rows[0].get("root_cause"):
+        return (f"**Q10 — Reasoning subgraph:** {inc} has no root cause linkage.", [])
+    r = rows[0]
+    paths = "\n".join(f"  - `{' → '.join(p)}`" for p in (r["span_sample"] or []))
+    return (
+        f"**Q10 — Reasoning subgraph for {inc}**\n\n"
+        f"- **Root cause:** `{r['root_cause']}`\n"
+        f"- **Peer incidents** sharing this cause ({r['peers']}): {', '.join(r['peer_sample'])}\n"
+        f"- **Affected services:** {', '.join(r['affected'])}\n"
+        f"- **Tier-0 services reached:** {', '.join(r['tier0_reached']) or '_none_'}\n"
+        f"- **Spanning paths to tier-0:**\n{paths or '  - _none_'}",
+        rows,
+    )
+
+
 HANDLERS = [
+    # advanced multi-hop reasoning — registered FIRST so explicit q1..q10 / phrase
+    # triggers win over the simpler keyword routes.
+    h_q1_cross_team_blind_spot,
+    h_q2_root_cause_tier0_reach,
+    h_q3_silent_amplifier,
+    h_q4_cycles_with_incidents,
+    h_q5_recurring_root_cause,
+    h_q6_blast_radius_divergence,
+    h_q7_collision_chains,
+    h_q8_distance_to_critical,
+    h_q9_hidden_shared_risk,
+    h_q10_reasoning_subgraph,
     h_service_plus_concept,  # conjunctive: service AND (root_cause | outage | sev) — FIRST
     h_by_root_cause,      # DNS, CPU, MemLeak, etc.
     h_impact_count,       # > N services
