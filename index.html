@@ -1042,6 +1042,16 @@ function GraphVizPanel(){
     return ()=>window.removeEventListener("gv:focus", h);
   },[]);
 
+  // Publish the current graph selection on every change so AgentChatPanel can
+  // resolve deictic questions like "what is this node?".
+  useEffect(()=>{
+    const id = simRef.current.selectedId;
+    if(!id){ window.__gvSelected = null; return; }
+    const idx = (window.__gvIndex || {});
+    const label = idx[id] || (id.startsWith("INC-") ? "Incident" : null);
+    window.__gvSelected = { id, label };
+  }, [selectedTick]);
+
   // fetch snapshot
   useEffect(()=>{
     let cancel = false;
@@ -1633,7 +1643,41 @@ function AgentChatPanel(){
   ];
   const send = async text => {
     if(!text.trim()) return;
-    setMsgs(m=>[...m,{role:"user",text},{role:"asst",text:"…thinking (querying Neo4j)"}]);
+    // Resolve deictic references ("this node", "this one", "it", "that service"…)
+    // against the node currently selected in the Graph Viewer.
+    const sel = (typeof window !== "undefined") ? window.__gvSelected : null;
+    const raw = text;
+    const low = text.toLowerCase();
+    const deictic = /\b(this|that|the selected|currently selected|it)\b.*\b(node|one|service|incident|team|root\s*cause|deployment)?\b/.test(low)
+      || /\b(what|who|why|tell me|describe|explain)\b.*\b(this|that|it|selected)\b/.test(low);
+    let question = text;
+    let preface = null;
+    if(deictic && sel && sel.id){
+      // Rewrite the question into a concrete, handler-friendly form based on
+      // the selected node's label. This lets the existing chat_server
+      // handlers (RCA, blast radius, owner, root-cause lookup) answer it.
+      const id = sel.id, label = sel.label || "";
+      preface = `_Resolved “this/that/selected” → **${label || "node"}** \`${id}\` (from Graph Viewer selection)._\n\n`;
+      if(/^why|fail|rca|root cause|cause/.test(low) && label === "Incident"){
+        question = `Why did ${id} fail?`;
+      } else if(label === "Incident"){
+        question = `Why did ${id} fail?`;
+      } else if(label === "Service"){
+        if(/owner|owns|team|who/.test(low))            question = `Which team owns ${id}?`;
+        else if(/depend|downstream|upstream/.test(low)) question = `Which services depend on ${id}?`;
+        else if(/blast|radius|impact/.test(low))        question = `Blast radius of ${id} up to 2 hops`;
+        else                                            question = `incidents on ${id}`;
+      } else if(label === "RootCause"){
+        question = `Any incidents related to ${id}?`;
+      } else if(label === "Team"){
+        question = `Which services does ${id} own?`;  // handled by owner/dependents heuristics server-side
+      } else if(label === "Deployment"){
+        question = `Regressions introduced by deployments`;
+      } else {
+        question = `Tell me about ${id}`;
+      }
+    }
+    setMsgs(m=>[...m,{role:"user",text:raw},{role:"asst",text:"…thinking (querying Neo4j)"}]);
     setInput("");
     let reply = null;
     let trace = null;
@@ -1641,7 +1685,7 @@ function AgentChatPanel(){
       const r = await fetch("http://127.0.0.1:8765/chat", {
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ question: text })
+        body: JSON.stringify({ question })
       });
       if(r.ok){
         const j = await r.json();
@@ -1650,10 +1694,11 @@ function AgentChatPanel(){
       }
     } catch(_e){ /* server offline -> fallback */ }
     if(reply === null){
-      const out = answerNlQuery(text, contextRef.current);
+      const out = answerNlQuery(question, contextRef.current);
       contextRef.current = { ...contextRef.current, ...out.ctx };
       reply = "[offline-fallback] " + out.text;
     }
+    if(preface) reply = preface + reply;
     setMsgs(m=>{
       const base = m.slice(0,-1); // drop the …thinking placeholder
       return [...base,{role:"asst",text:reply,trace}];
