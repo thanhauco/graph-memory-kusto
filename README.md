@@ -255,3 +255,10 @@ ingest → analyze → summarize → write → review
 - `claude-opus-4-6` — deep coding
 - `claude-sonnet-4-6` — agent chat
 - Azure OpenAI `gpt-4o` + `text-embedding-3-small` — synthesis & embeddings
+
+
+## Start all services local
+docker start gmk-neo4j
+$env:NEO4J_URI='bolt://localhost:7688'; $env:NEO4J_USER='neo4j'; $env:NEO4J_PASS='neo4jpass'
+python graph-service\chat_server.py   # in one terminal
+python -m http.server 8080 --bind 127.0.0.1   # in another, then open http://localhost:8080
