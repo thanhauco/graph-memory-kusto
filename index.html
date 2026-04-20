@@ -947,7 +947,13 @@ function renderMarkdown(src){
     return `<a href="#" class="gv-focus px-1 rounded border no-underline ${cls}" data-gv-id="${id}" data-gv-label="${label||""}" onclick="return window.__gvFocus &amp;&amp; window.__gvFocus('${id.replace(/'/g,"\\'")}')">${t}</a>`;
   };
   // Linkify INC-xxxx unconditionally (Incidents aren't always in the snapshot).
-  const linkifyIncidents = s => s.replace(/\b(INC-\d+)\b/g, (_m,id)=>mkChip(id,"Incident",id));
+  // IMPORTANT: skip segments that are already inside an <a> tag produced by
+  // linkifyKnown, otherwise the regex re-matches INC-xxxx in the anchor's
+  // attributes and mangles the HTML.
+  const linkifyIncidents = s => s.split(/(<a\b[^>]*>[\s\S]*?<\/a>)/g).map(chunk => {
+    if(chunk.startsWith("<a ")) return chunk;
+    return chunk.replace(/\b(INC-\d+)\b/g, (_m,id)=>mkChip(id,"Incident",id));
+  }).join("");
   // Linkify known Service/Team/RootCause/Deployment names that appear inside
   // `backticks` (the chat_server wraps them) using the live graph index.
   const linkifyKnown = s => s.replace(
