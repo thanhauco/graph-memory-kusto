@@ -1576,6 +1576,21 @@ function AgentChatPanel(){
     "Q9 hidden shared risk pairs",
     "Q10 reasoning subgraph for INC-1008",
   ];
+  // Queries designed to beat pure vector/semantic search. Each one requires
+  // traversal, path closure, set intersection, or temporal joins — things a
+  // vector index cannot do.
+  const vectorBeatsPresets = [
+    { q: "Which teams own services in the blast radius of CacheLayer up to 2 hops?",
+      why: "needs multi-edge traversal (DEPENDS_ON*1..2 + OWNS)" },
+    { q: "Detect cycles",
+      why: "path closure — a vector index has no concept of cycles" },
+    { q: "Q9 hidden shared risk pairs",
+      why: "set intersection over path-expanded neighborhoods + NOT EXISTS" },
+    { q: "Q5 recurring root cause after deploy",
+      why: "4-way join (Deployment, Incident, Service, RootCause) with temporal order" },
+    { q: "Q2 root cause tier-0 reach",
+      why: "ranked shortestPath coverage of tier-API services per root cause" },
+  ];
   const send = async text => {
     if(!text.trim()) return;
     setMsgs(m=>[...m,{role:"user",text},{role:"asst",text:"…thinking (querying Neo4j)"}]);
@@ -1678,6 +1693,19 @@ function AgentChatPanel(){
             <button key={p} onClick={()=>send(p)}
               className="w-full text-left text-xs px-3 py-2 rounded-md border border-rose-500/40 bg-rose-500/10 hover:bg-rose-500/20 text-rose-200 font-medium">
               {p}
+            </button>)}
+        </div>
+        <h3 className="font-semibold text-white mt-4 mb-2 flex items-center gap-2">
+          <span className="text-emerald-400">🎯 Graph beats Vector</span>
+          <span className="text-[10px] text-slate-400 font-normal">(demo: vector search fails here)</span>
+        </h3>
+        <div className="space-y-2">
+          {vectorBeatsPresets.map(p=>
+            <button key={p.q} onClick={()=>send(p.q)}
+              title={p.why}
+              className="w-full text-left text-xs px-3 py-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-100 font-medium">
+              <div>{p.q}</div>
+              <div className="text-[10px] text-emerald-300/80 font-normal mt-0.5">why: {p.why}</div>
             </button>)}
         </div>
       </Card>
