@@ -1117,7 +1117,19 @@ class ChatHandler(BaseHTTPRequestHandler):
 
 def serve(port: int = 8765):
     srv = ThreadingHTTPServer(("127.0.0.1", port), ChatHandler)
+    uri = os.getenv("NEO4J_URI", "bolt://localhost:7688")
     print(f"graph-chat listening on http://127.0.0.1:{port}")
+    print(f"  neo4j target: {uri} (override via NEO4J_URI env var)")
+    # Fail fast with a clear message if the driver can't reach Neo4j — this is
+    # the #1 source of support questions ("port 7687 vs 7688", container down).
+    try:
+        with driver().session() as s:
+            s.run("RETURN 1").consume()
+        print("  neo4j: connection OK")
+    except Exception as e:
+        print(f"  neo4j: CANNOT CONNECT → {e}")
+        print("  hint: is 'gmk-neo4j' running? expected Bolt on localhost:7688")
+        print("        docker ps --filter name=gmk-neo4j --format '{{.Names}}  {{.Ports}}'")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

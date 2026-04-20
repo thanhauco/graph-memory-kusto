@@ -116,6 +116,25 @@ foreach ($x in $q) {
 
 Use this path when port 7687 is already occupied by another demo.
 
+> **⚠️ Neo4j Browser port gotcha**
+>
+> Neo4j Browser defaults to `bolt://localhost:7687`. This project's dedicated
+> container publishes Bolt on **`7688`** (to avoid collisions with other local
+> Neo4j demos). If you see *"Could not connect"* in the Browser:
+>
+> 1. In the **Connect URL** field change the port from `7687` → **`7688`**.
+> 2. User: `neo4j`  Password: `neo4jpass`.
+>
+> Verify the container is up and the port mapping is correct:
+> ```powershell
+> docker ps --filter name=gmk-neo4j --format "{{.Names}}  {{.Ports}}"
+> # expect: gmk-neo4j  0.0.0.0:7475->7474/tcp, 0.0.0.0:7688->7687/tcp
+> ```
+>
+> If you prefer the **standard 7687 port**, replace the `-p 7688:7687` line in
+> step 1 below with `-p 7687:7687` and update `NEO4J_URI` everywhere to
+> `bolt://localhost:7687`.
+
 ### 1) Run a dedicated Neo4j container
 
 ```powershell
@@ -133,10 +152,11 @@ docker run -d --name gmk-neo4j `
 
 | Field | Value |
 |---|---|
-| Browser URL | http://localhost:7475 |
-| Bolt URI | bolt://localhost:7688 |
-| Username | neo4j |
-| Password | neo4jpass |
+| Browser URL       | http://localhost:7475 |
+| Bolt URI          | bolt://localhost:**7688** (⚠ not the default 7687) |
+| Browser Connect URL | change port to **7688** in the login dialog |
+| Username          | neo4j |
+| Password          | neo4jpass |
 
 ### 3) Seed 400-incident mock graph data
 
