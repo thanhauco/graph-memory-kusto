@@ -55,16 +55,27 @@ def _dynamic_context(question: str) -> str:
 
 
 def answer(question: str) -> str:
-    if AzureOpenAI is None:
-        raise RuntimeError("openai package not installed; cannot call LLM")
-    client = AzureOpenAI(
-        api_key=os.environ["AZURE_OPENAI_KEY"],
-        api_version="2024-06-01",
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-    )
+    nvidia_key = os.getenv("NVIDIA_API_KEY")
+    if nvidia_key:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=nvidia_key,
+            base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+        )
+        model = os.getenv("NVIDIA_MODEL", "z-ai/glm-5.2")
+    else:
+        if AzureOpenAI is None:
+            raise RuntimeError("openai package not installed; cannot call LLM")
+        client = AzureOpenAI(
+            api_key=os.environ["AZURE_OPENAI_KEY"],
+            api_version="2024-06-01",
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        )
+        model = os.getenv("AOAI_CHAT_DEPLOY", "gpt-4o")
     messages = build_messages(question, dynamic_context=_dynamic_context(question))
     resp = client.chat.completions.create(
-        model=os.getenv("AOAI_CHAT_DEPLOY", "gpt-4o"),
+        model=model,
         messages=messages,
         temperature=0.2,
     )

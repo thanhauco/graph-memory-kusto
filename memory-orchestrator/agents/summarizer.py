@@ -13,13 +13,24 @@ _SYS = (
 
 
 def run(hop_path: str, context: str) -> str:
-    client = AzureOpenAI(
-        api_key=os.environ["AZURE_OPENAI_KEY"],
-        api_version="2024-06-01",
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-    )
+    nvidia_key = os.getenv("NVIDIA_API_KEY")
+    if nvidia_key:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=nvidia_key,
+            base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+        )
+        model = os.getenv("NVIDIA_MODEL", "z-ai/glm-5.2")
+    else:
+        client = AzureOpenAI(
+            api_key=os.environ["AZURE_OPENAI_KEY"],
+            api_version="2024-06-01",
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        )
+        model = os.getenv("AOAI_CHAT_DEPLOY", "gpt-4o")
     r = client.chat.completions.create(
-        model=os.getenv("AOAI_CHAT_DEPLOY", "gpt-4o"),
+        model=model,
         messages=[
             {"role": "system", "content": _SYS},
             {"role": "user",   "content": f"hop_path: {hop_path}\ncontext: {context}"},
